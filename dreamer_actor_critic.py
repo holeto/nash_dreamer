@@ -30,7 +30,9 @@ def reinforce_loss_with_range(
   needs to add it explicitly here, adding it in TD-estimation
   will not promote exploration, but rather
   even further artifically upweight values. Multiply this by -1 to get loss."""
-  advantage = returns - values
+  #The returns and values are both from the perspective of player 1
+  p1_advantage = returns - values
+  advantage = jnp.stack([p1_advantage, -p1_advantage], axis=-2)
   advantage = jax.lax.stop_gradient(advantage / jnp.maximum(1, return_range))
 
   entropy_bonus = -entropy_eta * jnp.sum(log_pi * pi, axis=-1, keepdims=True)
@@ -43,14 +45,14 @@ def td_estimate(
   v: chex.Array,
   valid: chex.Array,
   reward: chex.Array,
-  lambda_: float = 1.0,
+  lambda_: float = 1.0, #lambda in TD(lambda)
   gamma: float = 1.0 # Discount factor
 ):
   """Computes the TD-lambda estimate of the return. Only for the on-policy case.
   (This implementation is esentially V-trace in RNaD without the importance sampling).
   This is designed to work over the entire trajectory without bootstrapping"""
   
-  reward = jnp.expand_dims(jnp.stack((reward, -reward), axis=-1), -1)
+  reward = jnp.expand_dims(reward, -1)
   
   @chex.dataclass(frozen=True)
   class TDCarry: 
@@ -64,9 +66,9 @@ def td_estimate(
   )
 
   def _td_estimate(carry: TDCarry, x) -> tuple[TDCarry, Any]:
-    (v, entropy_reward,valid) = x 
+    (v, reward,valid) = x 
     
-    delta_v = (entropy_reward + gamma * carry.next_value - v)
+    delta_v = (reward + gamma * carry.next_value - v)
     carry_delta_v = delta_v + lambda_ * gamma * carry.delta_v
     
     v_target = v + carry_delta_v
@@ -108,12 +110,12 @@ class DreamerActorCritic():
     self.use_real_infoset = ma_rssm.use_real_infoset
     self.input_size = ma_rssm.infoset_size
 
-    num_last = self.config.num_last
+    num_starts = self.config.num_starts
     #If negative, take all for unroll, the Dreamer trajectories
     # will have one more timestep, hence + 1
-    if num_last <= 0:
-      num_last = game.max_trajectory_lenght_no_chance()
-    self.num_last = num_last
+    if num_starts <= 0:
+      num_starts = game.max_trajectory_lenght_no_chance()
+    self.num_starts = num_starts
 
     self.return_range = jnp.array(0)
     #self.cached_step = nnx.cached_partial(self.update_paramaters_and_model, self.optimizer, self.target_optimizer)
@@ -167,7 +169,7 @@ class DreamerActorCritic():
        
       v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range)
       
-      expanded_valid = jnp.expand_dims(timestep.valid, (-1, -2))
+      expanded_valid = jnp.expand_dims(timestep.valid, -1)
       #Watch out! Do not call legal_log_policy here, as
       # it assumes a logit and not a softmaxed policy, so we get
       # different results
@@ -189,7 +191,7 @@ class DreamerActorCritic():
         loss_reinforce = reinforce_loss_with_range(pi, log_pi, v_train_target, v_target, timestep.action, new_range, self.config.eta)
         # The multiplication by -1 is critical here, otherwise we would
         # be minimizing the neurd term, but we want to maximize it.
-        reinforce_loss_value = -get_loss_mean_with_mask(loss_reinforce, expanded_valid)
+        reinforce_loss_value = -get_loss_mean_with_mask(loss_reinforce, expanded_valid[..., None])
       else:
         reinforce_loss_value = 0
 
@@ -221,7 +223,9 @@ class DreamerActorCritic():
       
     
     ac_timestep = wm_timestep_to_timestep(wm_timestep, wm_prediction_step, self.use_real_infoset)  
-    starting_points = jax.tree.map(lambda x: x[-self.num_last: ].reshape((-1, *x.shape[2:])), wm_prediction_step)
+    #starting_points = jax.tree.map(lambda x: x[-self.num_starts: ].reshape((-1, *x.shape[2:])), wm_prediction_step)
+    #Start imagination from the root and collapse the first two dimensions into num_starts * batch
+    starting_points = jax.tree.map(lambda x: jnp.repeat(x[0][None, ...], self.num_starts, axis=0).reshape((-1, *x.shape[2:])), wm_prediction_step)
     #starting_points = jax.tree.map(lambda x: x[0].reshape((-1, *x.shape[2:])), wm_prediction_step)
     #jax.tree.map(lambda x: print(x.shape), starting_points)
     img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
@@ -259,6 +263,7 @@ class DreamerActorCritic():
 
     #This grad coupled with vanilla SGD optimizer 
     # is equivalent to the EMA formula (1 - alpha) * state_target + alpha * state
+    # which in turn corresponds to TD update
     target_grad = jax.tree.map(lambda a, b: a - b, state_target, state)
     target_optimizer.update(target_grad)
 

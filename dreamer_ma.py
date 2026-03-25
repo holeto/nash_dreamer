@@ -14,8 +14,6 @@ from replay_buffer import ReplayBuffer
 from dreamer_actor_critic import DreamerActorCritic
 from rnad_dreamer import RNaDDreamer
 
-LATEST_STEP_FILENAME = "latest.txt"
-
 
 
 class DreamerMA():

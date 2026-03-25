@@ -3,12 +3,13 @@ import os
 from shutil import rmtree
 
 from dreamer_ma import DreamerMA, DreamerMAConfig, LATEST_STEP_FILENAME
+from sim_rnad import SimRNaD
 from games.jax_game import JaxGame
 from train_utils import *
 from experiments.eval_utils import track
 
 
-def train(args, game: JaxGame):
+def train_nash_dreamer(args, game: JaxGame):
   """Perform the NashDreamer training on a particular game
 
   Args:
@@ -80,7 +81,7 @@ def train(args, game: JaxGame):
         eta=args.eta,
         sampling_epsilon=args.img_sampling_epsilon,
 
-        num_last = args.num_last,
+        num_starts = args.num_starts,
 
         #World model extraction parameters
         state_sample_threshold=args.state_sample_threshold,
@@ -124,7 +125,7 @@ def train(args, game: JaxGame):
       upper_percentile = args.upper_percentile,
       lower_percentile = args.lower_percentile,
       range_ema_coeff = args.range_ema_coeff,
-      num_last = args.num_last,
+      num_starts = args.num_starts,
 
       sampling_epsilon=args.img_sampling_epsilon,
 
@@ -145,17 +146,17 @@ def train(args, game: JaxGame):
     )
   model = DreamerMA(wm_config, buffer_config, ac_config, opt_config, game, seeds[0])
   for seed in seeds:
-    joint_train_loop(args, seed, model)
+    train_loop(args, seed, model)
 
 @track
-def joint_train_loop(args, seed:int, template_model: DreamerMA):
+def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
   """Run the actual training loop
 
   Args:
       args (_type_): Argument specification. Detailed description of arguments can be found in parsing_utils.py
       seed (int): The PRNG seed for this training instance
-      template_model (DreamerMA): A precreated template model, that has the same 
-      parameters as all the models during the training, except seed. This is used
+      template_model (DreamerMA|SimRNaD): A precreated template model, that has the same 
+      configuration as all the models during the training, except seed. This is used
       to just update the network/optimizer state and seed of the template model
       instead of initializing new one each time, to avoid unnnecessary retracing.
   """
@@ -163,8 +164,8 @@ def joint_train_loop(args, seed:int, template_model: DreamerMA):
   game = template_model.game
   model_save_dir = args.model_save_dir
   if not model_save_dir:
-      
-      model_save_dir = f"/trained_networks/{args.train_mode}/{game.to_compact_str()}/seed_{seed}/"
+      algo_str = f"nash_dreamer_{args.train_mode}" if isinstance(template_model, DreamerMA) else f"rnad"
+      model_save_dir = f"/trained_networks/{algo_str}/{game.to_compact_str()}/seed_{seed}/"
       model_save_dir = os.getcwd() + model_save_dir
   saved_model_file = ""
   if args.clean_dir:
@@ -186,12 +187,15 @@ def joint_train_loop(args, seed:int, template_model: DreamerMA):
   if saved_model_file:
     print(f"Loading model from path {saved_model_file}")
     model = load_model(saved_model_file)
-    assert isinstance(model, DreamerMA), f"The loaded model should be a DreamerMA instance, not {model.__class__}"
+    assert isinstance(model, DreamerMA| SimRNaD), f"The loaded model should be a DreamerMA or SimRNaD instance, not {model.__class__}"
     assert seed == model.init_seed, f"The given seed {seed} and the initial seed of the stored model {model.init_seed} do not match."
 
   else:
     print("Creating clean model")
-    model = DreamerMA(template_model.wm_config, template_model.buffer_config, template_model.ac_config, template_model.opt_config, game, seed)
+    if isinstance(template_model, DreamerMA):
+      model = DreamerMA(template_model.wm_config, template_model.buffer_config, template_model.ac_config, template_model.opt_config, game, seed)
+    else:
+      model = SimRNaD(template_model.game, template_model.config, template_model.opt_config, seed, template_model.batch_size)
   #Will still retrace the nnx networks.
   # We have to do this, as the seed affects
   # their initialization as well.

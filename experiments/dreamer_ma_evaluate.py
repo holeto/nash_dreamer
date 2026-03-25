@@ -118,6 +118,7 @@ def model_walk_test(model:DreamerMA,
     return jnp.stack([p1_obs, p2_obs], axis=0)
   use_real_infoset = model.use_real_infoset
 
+
   get_obs_fn = get_both_obs 
   #get_closest_deter_fn = get_closest_deter_ma if is_ma else get_closest_deter
   num_players = model.game.num_players()

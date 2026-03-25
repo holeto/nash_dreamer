@@ -36,10 +36,13 @@ class MARSSM(nnx.Module):
     latent_infoset_size = wm_config.infoset_network_details[0]
     #If recurrent state size is unset, set it to the minimal
     # size possible to capture all the context. Eg.
-    # the size of the infoset tensor
+    # the size of the joint infoset tensor. This could in fact be compressed
+    # further, because the current observation is contained in the sampled
+    # outcome of the stochastic state. However, it is in general unclear
+    # how much more information that reveals, so we keep the state slightly larger.
     if rec_state_size < 1:
       rec_state_size = self.num_players * game.information_state_tensor_shape()
-    #Similarly for the latent infoset
+    #Similarly for the latent infoset, except here it actually is the minimal size
     if latent_infoset_size < 1:
       latent_infoset_size = game.information_state_tensor_shape()
     self.rec_state_size = rec_state_size

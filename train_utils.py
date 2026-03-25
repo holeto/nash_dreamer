@@ -7,6 +7,10 @@ import pickle
 
 from typing import Sequence, Tuple
 
+
+
+LATEST_STEP_FILENAME = "latest.txt"
+
   
 
 @chex.dataclass(frozen=True)
@@ -98,7 +102,7 @@ class RNaDConfig:
   gamma_vtrace: float = 1.0 # Discount factor
   lambda_vtrace: float = 1.0 #Same as TD-learning lambda
   
-  num_last: int = -1 #How many last timesteps to take from each trajectory for the imagination unroll. Take all of them if -1
+  num_starts: int = -1 #How many starting points to take from each trajectory for the imagination unroll. IF -1 take the same amount as the length of the trajectory.
 
   #NeuRD parameters
   neurd_clip: float = 10000
@@ -175,7 +179,7 @@ class ActorCriticConfig():
   upper_percentile: float = 95
   lower_percentile: float = 5 #Percentiles for the return normalization range
   range_ema_coeff: float = 0.99 # Coeeficient for the EMA update of retun normalization range
-  num_last: int = -1 #How many last timesteps to take from each trajectory for the imagination unroll. Take all of them if -1
+  num_starts: int = -1 #How many starting points to take from each trajectory for the imagination unroll. IF -1 take the same amount as the length of the trajectory.
 
   #Ordered as hidden layer size, num hidden layers
   actor_network_details: Tuple[int, int] = (256, 1)

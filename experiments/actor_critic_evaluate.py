@@ -35,7 +35,9 @@ def parse_env_returns(model_dir):
     Returns: (steps, return_values, game_str, smoothing_window)
     """
     return_file = model_dir + "/env_returns.txt"
-    assert os.path.exists(return_file), f"File {return_file} does not exist!"
+    if not os.path.exists(return_file):
+        print(f"File {return_file} does not exist!")
+        return None, None, None, None
     with open(return_file, 'r') as f:
        lines = f.readlines()
     #The first line contains the game_string
@@ -90,10 +92,15 @@ def get_metrics_from_dir(model_dir, args):
         #try:
         if first:
             model = load_model(model_path)
-            assert isinstance(model, DreamerMA), f"Expected DreamerMA, got {model.__class__}"
+            if isinstance(model, DreamerMA):
+                pass
+            elif isinstance(model, SimRNaD):
+                pass
+            else:
+                assert False, f"Expected DreamerMA or SimRNAD, got {model.__class__}"
             
             # Initialize Game
-            if not model.optimizer.model.use_real_infoset:
+            if isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset:
                 game = DreamerModelGame(model)
             else:
                 game = model.game
@@ -101,10 +108,11 @@ def get_metrics_from_dir(model_dir, args):
         else:
             temp_model = load_model(model_path)
             nnx.update(model.optimizer, nnx.state(temp_model.optimizer))
-            model.actor_critic.learner_steps = temp_model.actor_critic.learner_steps
+            if isinstance(model, DreamerMA):
+                model.actor_critic.learner_steps = temp_model.actor_critic.learner_steps
             model.learner_steps = temp_model.learner_steps
             
-            if not model.optimizer.model.use_real_infoset:
+            if isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset:
                 game = DreamerModelGame(model)
 
         # Calculate Metric
@@ -138,7 +146,7 @@ def get_metrics_from_dir(model_dir, args):
 
 def plot_comparison(args):
     """
-    Main function to plot Reinforce vs RNaD for a specific game/seed.
+    Main function to plot NashDreamer vs RNaD for a specific game.
     """
     base_path = args.base_path
     game_path = args.game_name 
@@ -147,7 +155,7 @@ def plot_comparison(args):
     
     # Define the two algorithms to compare
     algos = {
-        "Reinforce": [os.path.join(base_path, "reinforce", game_path, p) for p in seed_paths],
+        "NashDreamer": [os.path.join(base_path, "nash_dreamer_rnad", game_path, p) for p in seed_paths],
         "RNaD": [os.path.join(base_path, "rnad", game_path, p) for p in seed_paths]
     }
     
@@ -211,10 +219,10 @@ def plot_comparison(args):
     else:
         metric_str = f"Env returns smoothed with a {smoothing_window} window"
         plot_str = f"env_return_window_{smoothing_window}"
-        x_name = "Env steps"
+        x_name = "Environment steps"
     
     # Plot Algorithm Curves
-    colors = {'Reinforce': 'tab:red', 'RNaD': 'tab:blue'}
+    colors = {'NashDreamer': 'tab:red', 'RNaD': 'tab:blue'}
     
     for algo_name, seed_data in results.items():
         if not seed_data:
@@ -257,9 +265,11 @@ def plot_comparison(args):
         # 2. Plot Mean Line
         # We plot this LAST so it appears on top of the individual seeds.
         # We add the label here so it appears in the legend once.
-        ax.plot(ref_steps, mean, 
+        ax.plot(ref_steps, mean,
+                #label="Smoothed returns with rolling average over 32 trajectories",
+                #color='blue', 
                 label=algo_name, 
-                color=color, 
+                color=color,
                 linestyle='-', 
                 linewidth=2.5)    # Thicker, solid line
 
@@ -272,10 +282,12 @@ def plot_comparison(args):
         ax.axhline(y=uniform_nash_conv, xmin=0, xmax=max_steps, color='orange', linestyle='--', label="Uniform Policy", alpha=0.7)
 
     # Styling
-    ax.legend()
-    ax.set_xlabel(x_name)
+    ax.legend(fontsize=15)
+    ax.set_xlabel(x_name, fontsize=15)
     ax.set_ylabel(metric_str)
-    ax.set_title(f"NashDreamer {metric_str} on {args.game_name}")
+    #ax.set_ylabel("Episode return", fontsize=15)
+    ax.set_title(f"Comparison {metric_str} on {args.game_name}", fontsize=20)
+    #ax.set_title(f"NashDreamer obtained returns", fontsize=20)
     ax.grid(True, alpha=0.3)
     
     # if args.metric == "nash_conv":
@@ -314,7 +326,7 @@ def test_nash(args, saved_nash_path: str):
   # model = RNaDDreamerJoint(dreamer_model, RNaDConfig())
   assert isinstance(model, DreamerMA), f"The loaded model should be an instance of DreamerMA. Instead got {model.__class__}"
   
-  game = DreamerModelGame(model) if not model.optimizer.model.is_iig else  model.game
+  game = DreamerModelGame(model) if (isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset) else  model.game
   p1_nash_val, p2_nash_val, nash_infoset_map, nash_behaviorals = load_model(nash_path)
   print(f"Loaded nash policies of game with game value {p1_nash_val} (from player 1 perspective)")
   model_map, model_behaviorals = extract_model_policy(model, game)

@@ -104,7 +104,7 @@ class ReplayBuffer():
       self.online_batches = int(online_steps_per_batch / self.non_chance_trajectory_max)
       self.replayed_batches = self.wm_config.batch_size - self.online_batches
     
-    self.smoothed_returns = []
+    self.smoothed_returns = [0]
     self.smoothing_rewards = np.zeros(self.config.smoothing_window)
     self.smoothing_idx = 0
     self.smoothing_full = False
