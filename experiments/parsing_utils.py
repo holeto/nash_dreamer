@@ -16,6 +16,15 @@ def add_reinforce_arguments(parser: ArgumentParser) -> ArgumentParser:
   parser.add_argument("--num_last", type=int, default=-1, help="How many steps from the end of the trajectory to take as starting points for imagination. If <= 0, take the entire trajectory.")
 
 
+def add_replay_arguments(parser: ArgumentParser) -> ArgumentParser:
+  """Adds all the replay buffer required parameters to parser"""
+  parser.add_argument("--buffer_size", type=int, default=64, help="Size of the replay buffer.")
+  parser.add_argument("--replay_ratio", type=int, default=-1, help="The replay ratio, which defines the amount of online steps per minibatch. Respectively, the ratio is replay_ratio / (batch_size * trajectory_len). If -1, only online trajectories are sampled")
+  parser.add_argument("--return_log_frequency", type=int, default=10, help="How often to log trajectory return in the replay buffer in terms of collected minibatches")
+  parser.add_argument("--smoothing_window", type=int, default=64, help="How many returns to use for the running average window")
+  parser.add_argument("--log_returns", action="store_true", help="A flag whether to log the smoothed returns. They will be stored in the same directory as the model.")
+  return parser
+
 
 def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   """Adds all the world model required parameters to parser."""
@@ -27,18 +36,13 @@ def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   parser.add_argument("--encoder_tokens", type=int, default=256, help="Size of the observation latent representation produced by encoder.")
   parser.add_argument(f"--wm_bin_range", type=int, default=20, help="Number of the exponentially spaced bins for certain predictions such as reward in one direction, bins will be spaced out as symexp([-bin_range, ..., bin_range])")
 
-  parser.add_argument(f"--batch_size", type=int, default=32, help="Batch size for training")
+  parser.add_argument(f"--batch_size", type=int, default=64, help="Batch size for training")
   
   parser.add_argument(f"--use_original_infoset", action="store_true", help="A debug flag that forces training actor-critic on original game infosets even outside IIGs.")
   parser.add_argument(f"--latent_infoset_size", type=int, default=-1, help="Size of the latent infoset vector. If < 0, will make the latent infoset have the same size as real infoset")
 
   #Replay buffer parameters
-  parser.add_argument("--buffer_size", type=int, default=32, help="Size of the replay buffer.")
-  parser.add_argument("--replay_ratio", type=int, default=-1, help="The replay ratio, which defines the amount of online steps per minibatch. Respectively, the ratio is replay_ratio / (batch_size * trajectory_len). If -1, only online trajectories are sampled")
-  parser.add_argument("--trajectory_sample_eps", action="store_true", help="A flag whether to use the actor policy for trajectory sampling. If not, uniform policy is used instead.")
-  parser.add_argument("--return_log_frequency", type=int, default=10, help="How often to log trajectory return in the replay buffer in terms of collected minibatches")
-  parser.add_argument("--smoothing_window", type=int, default=32, help="How many returns to use for the running average window")
-  parser.add_argument("--log_returns", action="store_true", help="A flag whether to log the smoothed returns. They will be stored in the same directory as the model.")
+  parser = add_replay_arguments(parser)
   ## Loss function coefficients
   parser.add_argument("--beta_prediction", type=float, default=1, help="The beta coefficient for predictor loss")
   parser.add_argument("--beta_dynamics", type=float, default=1, help="The beta coefficient for dynamics (pushing prior prediction towards posterior) loss")
@@ -85,8 +89,8 @@ def add_rnad_arguments(parser: ArgumentParser) ->ArgumentParser:
   ##RNaD parameters  
   parser.add_argument("--eta", type=float, default=0.2, help="Strenght of the regularization in RNaD. Used for the reward transformation and the KL regularization for V-trace.")
   ##Entropy schedule- network switching
-  parser.add_argument("--entropy_schedule_size", default=(100, 1000), help="Defines how many iterations should be done for each item in the sequence.")
-  parser.add_argument("--entropy_schedule_repeats", default=(10,1), help="Defines amount of network switching sequences for each item in the sequence. Make sure last element is 1. For details see the EntropySchedule class.")
+  parser.add_argument("--entropy_schedule_size", default=(100, 2000), help="Defines how many iterations should be done for each item in the sequence.")
+  parser.add_argument("--entropy_schedule_repeats", default=(10, 1), help="Defines amount of network switching sequences for each item in the sequence. Make sure last element is 1. For details see the EntropySchedule class.")
 
   ##V-Trace paraemters
   parser.add_argument("--rho_vtrace", type=float, default=-1.0, help="Rho clipping parameter for V-Trace. If < 0 treated as infinity (no clipping)")
@@ -156,6 +160,7 @@ def add_nash_dreamer_arguments(parser: ArgumentParser):
   parser.add_argument("--state_sample_threshold", type=float, default=0.05, help="Threshold when sampling states. Outcomes below this threshold are ignored.")
   parser.add_argument("--terminal_threshold", type=float, default=0.5, help="Threshold when to consider the state terminal.")
   parser.add_argument("--legal_threshold", type=float, default=0.5, help="Threshold for considering actions legal.")
+  parser.add_argument("--wm_warm_up", type=int, default= 1000, help="Number of gradient steps for the world model, where we do not imagine yet and learn solely from real trajectories.")
   parser.add_argument(f"--ac_bin_range", type=int, default=20, help="Number of the exponentially spaced bins for the value categorical distribution prediction")
 
   parser.add_argument("--actor_hidden_features", type=int, default=256, help="Size of the hidden layer the actor network.")
@@ -194,7 +199,7 @@ def add_sim_rnad_arguments(parser: ArgumentParser):
   parser.add_argument("--continue_train", action="store_true", help="A flag whether to continue training from the latest stored step. If specified a clean model is trained.")
   parser.add_argument("--clean_dir", action="store_true", help="A flag whether to first delete the model store directory, if it already exists. Incompatible with continue train and takes precedence over it, if supplied together")
 
-  parser.add_argument(f"--batch_size", type=int, default=32, help="Minibatch size for the learning.")
+  parser.add_argument(f"--batch_size", type=int, default=64, help="Minibatch size for the learning.")
   parser.add_argument("--report_gradnorms", action="store_true", help="Whether to report gradient norms as well as losses.")
   
   parser.add_argument("--sampling_epsilon", type=float, default=0.0, help="Defines mix of uniform policy to the network learned policy during environment trajectory sampling.")
@@ -208,7 +213,11 @@ def add_sim_rnad_arguments(parser: ArgumentParser):
 
   parser.add_argument(f"--target_network_update", type=float, default=1e-3, help="1 - EMA coefficient for target network update")
 
+  #Optimizer arguments
   parser = add_optimizer_arguments(parser)
+  #Replay buffer arguments
+  parser = add_replay_arguments(parser)
+  #RNaD specific arguments
   parser = add_rnad_arguments(parser)
   return parser
 

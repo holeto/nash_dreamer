@@ -139,7 +139,10 @@ def get_metrics_from_dir(model_dir, args):
     metrics = np.asarray(metrics)
     if len(steps) > 0:
         sort_indices = np.argsort(steps)
-        return steps[sort_indices], metrics[sort_indices], game
+        sorted_steps = steps[sort_indices]
+        batch_size = model.wm_config.batch_size if isinstance(model, DreamerMA) else model.batch_size
+        env_steps = sorted_steps * (batch_size * model.game.max_trajectory_length())
+        return env_steps, metrics[sort_indices], game
     else:
         return [], [], game
 
@@ -219,7 +222,6 @@ def plot_comparison(args):
     else:
         metric_str = f"Env returns smoothed with a {smoothing_window} window"
         plot_str = f"env_return_window_{smoothing_window}"
-        x_name = "Environment steps"
     
     # Plot Algorithm Curves
     colors = {'NashDreamer': 'tab:red', 'RNaD': 'tab:blue'}
@@ -283,7 +285,8 @@ def plot_comparison(args):
 
     # Styling
     ax.legend(fontsize=15)
-    ax.set_xlabel(x_name, fontsize=15)
+    ax.set_xlabel("Environment steps", fontsize=15)
+    #ax.set_xscale('log')
     ax.set_ylabel(metric_str)
     #ax.set_ylabel("Episode return", fontsize=15)
     ax.set_title(f"Comparison {metric_str} on {args.game_name}", fontsize=20)

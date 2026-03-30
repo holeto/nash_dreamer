@@ -7,11 +7,9 @@ import optax
 import flax.nnx as nnx
 import chex
 
-import numpy as np
-
 
 from functools import partial
-from typing import Any
+from collections import defaultdict
 
 from games.jax_game import JaxGame
 from ma_rssm import *
@@ -64,9 +62,7 @@ class RNaDDreamer():
 
     self._prev_network = nnx.merge(rnad_graphdef, rnad_state)
 
-    self.imagine = self.config.beta_imagination > 0
-
-    self.metrics_keys = ['img_val', 'img_policy', 'real_val'] if self.imagine else ['real_val']
+    self.metrics_keys = ['img_val', 'img_policy', 'real_val']
     if self.config.train_real_policy:
       self.metrics_keys.append('real_policy')
     self.metrics = {k: 0 for k in self.metrics_keys}
@@ -75,7 +71,7 @@ class RNaDDreamer():
     
   
 
-  @partial(nnx.jit, static_argnums=(0,))
+  @partial(nnx.jit, static_argnums=(0, 9))
   def update_parameters_and_model(
     self,
     optimizer: nnx.Optimizer,
@@ -85,7 +81,8 @@ class RNaDDreamer():
     trajectory_key,
     wm_timestep: TimeStep,
     wm_prediction_step: PredictionStepWithLegal,
-    learner_steps: int
+    learner_steps: int,
+    imagine: bool
   ):
     """Compute RNaD loss and use it to perform
     a gradient step of both RNaD and Dreamer."""
@@ -247,16 +244,20 @@ class RNaDDreamer():
     #For the reaches just add a leading 1 dimension for shape consistency
     #start_reaches_is = jnp.reshape(start_reaches_is, (-1, *start_reaches_is.shape[2:]))[None, ...]
 
-    img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
-      optimizer.model,
-      target_optimizer.model,
-      prev_network,
-      _prev_network,
-      trajectory_key, starting_points, start_reaches_is, alpha, self.config.beta_imagination)
-    
+    if imagine:
+      img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
+        optimizer.model,
+        target_optimizer.model,
+        prev_network,
+        _prev_network,
+        trajectory_key, starting_points, start_reaches_is, alpha, self.config.beta_imagination)
+      
 
-    img_loss, img_metrics = img_return
-    optimizer.update(igrad)                                
+      img_loss, img_metrics = img_return
+      optimizer.update(igrad) 
+    else:
+      img_metrics = {'img_val': 0, 'img_policy': 0}
+      igrad = {k: 0 for k in self.network_keys}                               
     r_return, rgrad = nnx.value_and_grad(real_loss, argnums=(0), has_aux=True)(
       optimizer.model,
       target_optimizer.model,
@@ -301,9 +302,10 @@ class RNaDDreamer():
 
   
   def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array):
+    should_imagine = self.learner_steps >= self.config.wm_warm_up_period
     self.prev_network, self._prev_network, self.metrics, self.grad_norms, update_regularization =  self.update_parameters_and_model(self.optimizer, self.target_optimizer, self.prev_network, 
                                                                                                                        self._prev_network, trajectory_key, wm_timestep, wm_prediction_step,
-                                                                                                                      self.learner_steps)
+                                                                                                                      self.learner_steps, should_imagine)
     self.learner_steps += 1
     self.policy_switch_steps += int(update_regularization)
   

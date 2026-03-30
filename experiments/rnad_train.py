@@ -1,5 +1,5 @@
 import jax.numpy as jnp
-from train_utils import RNaDConfig, OptimizerConfig, get_seeds
+from train_utils import RNaDConfig, OptimizerConfig, BufferConfig, get_seeds
 from experiments.joint_train import train_loop, SimRNaD, JaxGame
 
 
@@ -32,6 +32,12 @@ def train_rnad(args, game:JaxGame):
         
         target_network_update = args.target_network_update
     )
+  buffer_config = BufferConfig(buffer_size = args.buffer_size,
+                                sampling_epsilon = args.sampling_epsilon,
+                                replay_ratio = args.replay_ratio,
+                                smoothing_window = args.smoothing_window,
+                                log_returns = args.log_returns,
+                                return_log_frequency = args.return_log_frequency)
   opt_config = OptimizerConfig(lr = args.lr,
                                       agc = args.agc,
                                       eps = args.opt_eps,
@@ -42,6 +48,6 @@ def train_rnad(args, game:JaxGame):
                                       schedule = args.opt_schedule,
                                       warmup = args.warmup,
                                       anneal = args.anneal)
-  template_model = SimRNaD(game, config, opt_config, seeds[0], batch_size=args.batch_size)
+  template_model = SimRNaD(game, config, opt_config, buffer_config, seeds[0], batch_size=args.batch_size)
   for seed in seeds:
     train_loop(args, seed, template_model)

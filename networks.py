@@ -52,8 +52,8 @@ class ActorNetwork(nnx.Module):
     self.init_layer = LinNormRelu(input_features, hidden_features, rngs)
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
     #Initialize to uniform policy logits
-    #self.policy_head = nnx.Linear(hidden_features, action_features, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
-    self.policy_head = nnx.Linear(hidden_features, action_features, rngs=rngs)
+    self.policy_head = nnx.Linear(hidden_features, action_features, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
+    #self.policy_head = nnx.Linear(hidden_features, action_features, rngs=rngs)
     
   def __call__(self, input, legal):
     x = self.init_layer(input)

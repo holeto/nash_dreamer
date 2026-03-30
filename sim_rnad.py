@@ -16,6 +16,7 @@ from typing import Any
 from games.jax_game import JaxGame, GameState
 from ma_rssm import *
 from train_utils import *
+from replay_buffer import ActorReplayBuffer
 from distributions import get_bin_log_prob
 
 from optimizer import make_opt
@@ -297,9 +298,10 @@ class SimRNaD():
   """An off-policy simultaneous move game
   version of Regularized Nash Dynamics,
   as described in https://arxiv.org/pdf/2510.05048."""
-  def __init__(self, game: JaxGame, config: RNaDConfig, opt_config: OptimizerConfig, seed:int, batch_size:int=32) -> None:
+  def __init__(self, game: JaxGame, config: RNaDConfig, opt_config: OptimizerConfig, buffer_config: BufferConfig, seed:int, batch_size:int=32) -> None:
     self.config = config
     self.opt_config = opt_config
+    self.buffer_config = buffer_config
     self.game = game
     self.init_seed = seed
     self.batch_size = batch_size
@@ -309,6 +311,7 @@ class SimRNaD():
 
     self.actions = self.game.num_distinct_actions()
     self.num_players = self.game.num_players()
+    self.buffer = ActorReplayBuffer(self.game, self.buffer_config, self.init_seed, self.batch_size)
 
     #Subtract one from the trajectory lenght, we do not train on terminal nodes
     self.trajectory_max = self.game.max_trajectory_length() - 1
@@ -325,6 +328,7 @@ class SimRNaD():
     self.target_network = CriticNetwork(self.game.information_state_tensor_shape() * self.game.num_players(), self.config.bin_range,
                               self.config.critic_network_details[0], self.config.critic_network_details[1], rngs=self.network_rngs)
     self.ac_model = ACNetwork(self.game, self.config, self.network_rngs)
+    self.buffer.cache_sampling(self.ac_model.actor)
     optim_tx = make_opt(self.opt_config)
     self.optimizer = nnx.Optimizer(self.ac_model, tx=optim_tx)
 
@@ -345,31 +349,12 @@ class SimRNaD():
     self.network_keys = ['actor', 'critic']
     self.grad_norms = {}
 
-    self._get_example_timestep()
     
   
 
   def get_next_key(self):
     self.trajectory_key, key = jax.random.split(self.trajectory_key)
     return key
-   
-  def _get_example_timestep(self):
-    #This can produce a chance node, but that 
-    # one by default produces invalid infosets
-    # and legals so it is not a problem 
-    example_state, example_legals = self.game.initialize_structures()
-    _, ex_p1_infoset, ex_p2_infoset, _ = self.game.get_info(example_state)
-    ex_obs = jnp.stack([ex_p1_infoset, ex_p2_infoset], axis=0)
-    legal = jnp.ones(example_legals.shape, dtype=u8)
-    action = jax.nn.one_hot(jnp.argmax(legal, -1), legal.shape[-1]).astype(u8)
-    policy = legal.astype(float) / jnp.sum(legal, axis=-1, keepdims=True)
-    self.example_timestep = ActorCriticTimeStep(
-                                    obs= ex_obs,
-                                    legal=legal,
-                                    action=action,
-                                    policy = policy,
-                                    reward = 0.0,
-                                    valid = False)
 
   @partial(nnx.jit, static_argnums=(0,))
   def update_parameters_and_model(
@@ -483,125 +468,11 @@ class SimRNaD():
     prev_network = nnx.merge(actor_graphdef, state_prev)
     _prev_network = nnx.merge(actor_graphdef, _state_prev)
     return prev_network, _prev_network, r_metrics, grad_norms, update_regularization
-  
-
-  @partial(nnx.jit, static_argnums=(0))
-  def sample_batch_trajectories(self, actor_network: ActorNetwork, key):
-    batch_keys = jax.random.split(key, self.batch_size)
-    batch_sample_trajectories = nnx.vmap(self.sample_trajectory, in_axes=(None, 0), out_axes=(1))
-    batch_trajectories = batch_sample_trajectories(actor_network, batch_keys)
-    return batch_trajectories
-
-  @partial(nnx.jit, static_argnums=0)
-  def sample_trajectory(self, actor_network:ActorNetwork, key) ->TimeStep:
-    trajectory_key = jax.random.split(key, self.trajectory_max)
-    actions = self.actions
-
-    game_state, legal_actions = self.game.initialize_structures()
-    
-    @chex.dataclass(frozen=True)
-    class SampleTrajectoryCarry:
-      game_state: GameState
-      legal_actions: chex.Array
-      valid: bool
-      
-    init_carry = SampleTrajectoryCarry(
-      game_state = game_state,
-      legal_actions = legal_actions,
-      valid = jnp.array(True),
-    )
-    
-    
-    @nnx.jit
-    def choice_wrapper(key, p):
-      action = jax.random.choice(key, actions, p=p)
-      action_oh = jax.nn.one_hot(action, actions)
-      return action, action_oh
-
-    
-    vectorized_sample_action = nnx.vmap(choice_wrapper, in_axes=(0, 0), out_axes=0)
-
-    def get_actor_policy(actor_network: ActorNetwork, obs, legal_actions):
-      return actor_network(obs, legal_actions)[0]
-    #per player vmap
-    vectorized_get_actor = nnx.vmap(get_actor_policy, in_axes=(None, 0, 0), out_axes=0)
-
-    @nnx.scan(in_axes=(nnx.Carry, None, 0), out_axes=(nnx.Carry, 0))
-    def _sample_trajectory(carry: SampleTrajectoryCarry, actor_network:ActorNetwork, key) -> tuple[SampleTrajectoryCarry, chex.Array]:
-      
-      
-      state, p1_infoset, p2_infoset, public_state = self.game.get_info(carry.game_state)
-      action_key, chance_key = jax.random.split(key, 2)
-      
-      obs = jnp.stack((p1_infoset, p2_infoset), axis=0)
-      obs_for_actor = symlog(obs)
-        
-      pi = jax.lax.stop_gradient(vectorized_get_actor(actor_network, obs_for_actor, carry.legal_actions))
-      #uniform mix to the policy
-      normalization = jnp.sum(carry.legal_actions, axis=-1, keepdims=True)
-      uniform_pi = carry.legal_actions / (normalization + (normalization == 0))
-      pi = self.config.sampling_epsilon * uniform_pi + (1 - self.config.sampling_epsilon) * pi
-      is_chance = self.game.is_chance(carry.game_state)
-      action_key = jax.random.split(action_key, self.game.num_players())
-      action, action_oh = vectorized_sample_action(action_key, pi)
-      def apply_action():
-        return self.game.apply_action(carry.game_state, action)
-      def sample_chance():
-        outcomes, probs = self.game.get_outcomes_and_probs(carry.game_state)
-        # Do not forget for deterministic games to put nonzero probs
-        # to sample something for shape consistency
-        probs = jnp.where(is_chance, probs, jnp.ones_like(probs)/ probs.shape[0])
-        chosen_outcome = jax.random.choice(chance_key, outcomes, p=probs)
-        outcome, terminal, reward, chosen_legals = self.game.apply_action(carry.game_state, chosen_outcome)
-        return outcome, terminal, reward, chosen_legals
-      next_game_state, next_terminal, next_rewards, next_legal = jax.lax.cond(is_chance, sample_chance, apply_action)
-      timestep = ActorCriticTimeStep(
-        obs = obs,
-        legal = carry.legal_actions.astype(u8),
-        action = action_oh.astype(u8),
-        reward=next_rewards,
-        policy = pi,
-        valid = carry.valid,
-      )
-      #We do not train actor/critic on terminal steps
-      next_valid = jnp.logical_and(carry.valid, jnp.logical_not(next_terminal))
-
-      new_carry = SampleTrajectoryCarry(
-        game_state = next_game_state,
-        legal_actions=next_legal,
-        valid = next_valid
-
-      )
-        
-      
-      timestep = tree_where(carry.valid, timestep, self.example_timestep)
-      
-      return new_carry, (timestep, is_chance)
-    _, ys = _sample_trajectory(init_carry, actor_network, trajectory_key)
-    timestep, is_chance = ys
-    #For the rewards, playing action at chance node can give a valid reward,
-    # but playing into a chance node never does. Hence, we must shift the mask by one step forward
-    next_chance = jnp.roll(is_chance, 1, axis=0)
-    #This is used to remove the chance nodes from the trajectory
-    non_chance = jnp.nonzero(~is_chance, size=self.non_chance_trajectory_max)[0]
-    filtered_timestep = jax.tree.map(lambda x: jnp.take_along_axis(x, jnp.expand_dims(non_chance, axis=range(1, x.ndim)), axis=0).astype(x.dtype), timestep)
-    
-    
-    non_next_chance = jnp.nonzero(~next_chance, size=self.non_chance_trajectory_max)[0]
-    non_chance_timestep = ActorCriticTimeStep(obs= filtered_timestep.obs,
-                                    legal=filtered_timestep.legal,
-                                    action=filtered_timestep.action,
-                                    policy = filtered_timestep.policy,
-                                    reward = jnp.take_along_axis(timestep.reward, non_next_chance, axis=0).astype(timestep.reward.dtype),
-                                    valid = filtered_timestep.valid)
-
-    #[Trajectory, ...]
-    return non_chance_timestep
 
   
   def step(self):
     sample_key = self.get_next_key()
-    timestep = self.sample_batch_trajectories(self.ac_model.actor, sample_key)
+    timestep = self.buffer.mixed_sample(sample_key)
 
     self.prev_network, self._prev_network, self.metrics, self.grad_norms, update_regularization =  self.update_parameters_and_model(self.optimizer, self.target_optimizer, self.prev_network, 
                                                                                                                        self._prev_network, timestep,
@@ -632,6 +503,8 @@ class SimRNaD():
     
     #Start the training by sampling into the buffer,
     # to ensure that there are distinct data for at least one step
+    init_batch_key = self.get_next_key()
+    self.buffer.add_batch(self.batch_size, init_batch_key)
     for i in range(num_steps):
       self.step()
       if print_each > 0 and self.learner_steps % print_each == 0:
@@ -646,8 +519,9 @@ class SimRNaD():
 
   
   def __getstate__(self):
-      return {'config': self.config,
+      gen_state = {'config': self.config,
               'opt_config': self.opt_config,
+              'buffer_config': self.buffer_config,
               'seed': self.init_seed,
               'game': self.game,
               'batch_size': self.batch_size,
@@ -659,22 +533,28 @@ class SimRNaD():
               'prev_network': nnx.state(self.prev_network),
               '_prev_network': nnx.state(self._prev_network)
               }
+      buffer_state = self.buffer.getstate()
+      return {'gen': gen_state, 'buffer': buffer_state}
   
   def __setstate__(self, state):
-    self.config = state['config']
-    self.opt_config = state['opt_config']
-    self.init_seed = state['seed']
-    self.game = state['game']
-    self.batch_size = state['batch_size']
+    gen_state = state['gen']
+    self.config = gen_state['config']
+    self.opt_config = gen_state['opt_config']
+    self.buffer_config = gen_state['buffer_config']
+    self.init_seed = gen_state['seed']
+    self.game = gen_state['game']
+    self.batch_size = gen_state['batch_size']
 
     self.init()
 
-    self.learner_steps = state['learner_steps']
-    self.trajectory_key = state['trajectory_key']
+    self.learner_steps = gen_state['learner_steps']
+    self.trajectory_key = gen_state['trajectory_key']
 
-    nnx.update(self.optimizer, state['optimizer'])
-    nnx.update(self.target_optimizer, state['target_optimizer'])
-    self.policy_switch_steps = state['policy_steps']
-    nnx.update(self.prev_network, state['prev_network'])
-    nnx.update(self._prev_network, state['_prev_network'])
+    nnx.update(self.optimizer, gen_state['optimizer'])
+    nnx.update(self.target_optimizer, gen_state['target_optimizer'])
+    self.policy_switch_steps = gen_state['policy_steps']
+    nnx.update(self.prev_network, gen_state['prev_network'])
+    nnx.update(self._prev_network, gen_state['_prev_network'])
+
+    self.buffer.setstate(state['buffer'])
 

@@ -87,6 +87,7 @@ def train_nash_dreamer(args, game: JaxGame):
         state_sample_threshold=args.state_sample_threshold,
         terminal_threshold = args.terminal_threshold,
         legal_threshold = args.legal_threshold,
+        wm_warm_up_period = args.wm_warm_up,
 
         # Entropy schedule parameters
         entropy_schedule_size = args.entropy_schedule_size,
@@ -133,6 +134,7 @@ def train_nash_dreamer(args, game: JaxGame):
       state_sample_threshold=args.state_sample_threshold,
       terminal_threshold = args.terminal_threshold,
       legal_threshold = args.legal_threshold,
+      wm_warm_up_period = args.wm_warm_up,
       
       #TD-estimate parameters
       gamma = args.gamma,
@@ -195,7 +197,7 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
     if isinstance(template_model, DreamerMA):
       model = DreamerMA(template_model.wm_config, template_model.buffer_config, template_model.ac_config, template_model.opt_config, game, seed)
     else:
-      model = SimRNaD(template_model.game, template_model.config, template_model.opt_config, seed, template_model.batch_size)
+      model = SimRNaD(template_model.game, template_model.config, template_model.opt_config, template_model.buffer_config, seed, template_model.batch_size)
   #Will still retrace the nnx networks.
   # We have to do this, as the seed affects
   # their initialization as well.

@@ -10,7 +10,7 @@ from functools import partial
 from train_utils import *
 from distributions import *
 from ma_rssm import *
-from replay_buffer import ReplayBuffer
+from replay_buffer import WMReplayBuffer
 from dreamer_actor_critic import DreamerActorCritic
 from rnad_dreamer import RNaDDreamer
 
@@ -41,7 +41,7 @@ class DreamerMA():
   def init(self):
     self.jax_rngs = jax.random.key(self.init_seed)
 
-    self.buffer= ReplayBuffer(self.game, self.buffer_config, self.wm_config, self.init_seed, self.ac_config.state_sample_threshold)
+    self.buffer= WMReplayBuffer(self.game, self.buffer_config, self.wm_config, self.init_seed, self.ac_config.state_sample_threshold)
 
     rngs = nnx.Rngs(jax.random.key(self.init_seed))
     self.optimizer= create_dreamer_optimizer(self.game, self.wm_config, self.ac_config, self.opt_config, rngs)

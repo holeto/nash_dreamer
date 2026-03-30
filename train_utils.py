@@ -116,6 +116,7 @@ class RNaDConfig:
   terminal_threshold:float =  0.5 #Thresholds when to consider the state terminal, or the actions
   legal_threshold: float = 0.5    # Legal, when we take the sigmoid over the Dreamer produced logits.
   bin_range: int = 20 #Number of the exponentially spaced bins for the value categorical distribution prediction
+  wm_warm_up_period: int = 1000 #How many steps to let the world model "warm-up" and only train on real trajectories, before starting to imagine.
   
   target_network_update: float = 1e-3
 
@@ -192,6 +193,7 @@ class ActorCriticConfig():
   terminal_threshold:float =  0.5 #Thresholds when to consider the state terminal, or the actions
   legal_threshold: float = 0.5    # Legal, when we take the sigmoid over the Dreamer produced logits.
   bin_range: int = 20 #Number of the exponentially spaced bins for the value categorical distribution prediction
+  wm_warm_up_period: int = 1000 #How many steps to let the world model "warm-up" and only train on real trajectories, before starting to imagine.
 
 
 @chex.dataclass(frozen=True)
