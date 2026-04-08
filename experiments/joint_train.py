@@ -8,6 +8,7 @@ from games.jax_game import JaxGame
 from train_utils import *
 from experiments.eval_utils import track
 
+  
 
 def train_nash_dreamer(args, game: JaxGame):
   """Perform the NashDreamer training on a particular game
@@ -16,7 +17,7 @@ def train_nash_dreamer(args, game: JaxGame):
       args (_type_): Argument specification. Detailed description of arguments can be found in parsing_utils.py
       game (JaxGame): The game to train on
   """
-  seeds = get_seeds(args.seeds)
+  seeds = parse_sequence(args.seeds)
   #Create the initial model. All the other
   # models will only change the model 
   # state to prevent retracing
@@ -90,8 +91,8 @@ def train_nash_dreamer(args, game: JaxGame):
         wm_warm_up_period = args.wm_warm_up,
 
         # Entropy schedule parameters
-        entropy_schedule_size = args.entropy_schedule_size,
-        entropy_schedule_repeats = args.entropy_schedule_repeats,
+        entropy_schedule_size = parse_sequence(args.entropy_schedule_size),
+        entropy_schedule_repeats = parse_sequence(args.entropy_schedule_repeats),
         
         #V-Trace parameters
         rho_vtrace = args.rho_vtrace if args.rho_vtrace >= 0 else jnp.inf,
@@ -164,11 +165,12 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
   """
   print(f"Running the training for seed {seed}")
   game = template_model.game
-  model_save_dir = args.model_save_dir
-  if not model_save_dir:
-      algo_str = f"nash_dreamer_{args.train_mode}" if isinstance(template_model, DreamerMA) else f"rnad"
-      model_save_dir = f"/trained_networks/{algo_str}/{game.to_compact_str()}/seed_{seed}/"
-      model_save_dir = os.getcwd() + model_save_dir
+  model_root_dir = args.model_save_dir
+  if not model_root_dir:
+      model_root_dir = f"nash_dreamer_{args.train_mode}" if isinstance(template_model, DreamerMA) else f"rnad"
+  
+  model_save_dir = f"/trained_networks/{model_root_dir}/{game.to_compact_str()}/seed_{seed}/"
+  model_save_dir = os.getcwd() + model_save_dir
   saved_model_file = ""
   if args.clean_dir:
     if args.continue_train:

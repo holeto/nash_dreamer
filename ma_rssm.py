@@ -279,7 +279,13 @@ class MARSSM(nnx.Module):
   @partial(nnx.jit, static_argnums=4)
   def get_next_infoset_all(self, joint_latent_infoset: chex.Array, joint_cur_obs:chex.Array, joint_action:chex.Array, use_symlog=True):
     return self.get_next_infoset_all_no_jit(joint_latent_infoset, joint_cur_obs, joint_action, use_symlog)
-  
+
+  def get_next_infoset_no_jit(self, latent_infoset: chex.Array, cur_obs: chex.Array, action: chex.Array, use_symlog=True):
+    """Update latent infoset for a single player."""
+    if use_symlog:
+      cur_obs = symlog(cur_obs)
+    return MARSSM.call_net(self.infoset_network, latent_infoset, cur_obs, action)
+
   def get_infoset_decoder_all_no_jit(self, joint_latent_infoset:chex.Array, use_symexp=False):
     vectorized_infoset_decoder = MARSSM.vmap_over_net(self.infoset_decoder, in_axes=[(0, )], out_axes=[(0, 0)])
     output = vectorized_infoset_decoder(joint_latent_infoset)

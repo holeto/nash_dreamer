@@ -191,7 +191,7 @@ class DreamerActorCritic():
         loss_reinforce = reinforce_loss_with_range(pi, log_pi, v_train_target, v_target, timestep.action, new_range, self.config.eta)
         # The multiplication by -1 is critical here, otherwise we would
         # be minimizing the neurd term, but we want to maximize it.
-        reinforce_loss_value = -get_loss_mean_with_mask(loss_reinforce, expanded_valid[..., None])
+        reinforce_loss_value = -get_loss_mean_with_mask(loss_reinforce, expanded_valid[..., None], normalization_mult=2)
       else:
         reinforce_loss_value = 0
 

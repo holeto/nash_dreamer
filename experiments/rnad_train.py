@@ -1,10 +1,10 @@
 import jax.numpy as jnp
-from train_utils import RNaDConfig, OptimizerConfig, BufferConfig, get_seeds
+from train_utils import RNaDConfig, OptimizerConfig, BufferConfig, parse_sequence
 from experiments.joint_train import train_loop, SimRNaD, JaxGame
 
 
 def train_rnad(args, game:JaxGame):
-  seeds = get_seeds(args.seeds)
+  seeds = parse_sequence(args.seeds)
   config = RNaDConfig(
         bin_range = args.bin_range,
         report_gradnorms = args.report_gradnorms,
@@ -13,8 +13,8 @@ def train_rnad(args, game:JaxGame):
         sampling_epsilon=args.sampling_epsilon,
 
         # Entropy schedule parameters
-        entropy_schedule_size = args.entropy_schedule_size,
-        entropy_schedule_repeats = args.entropy_schedule_repeats,
+        entropy_schedule_size = parse_sequence(args.entropy_schedule_size),
+        entropy_schedule_repeats = parse_sequence(args.entropy_schedule_repeats),
         
         #V-Trace parameters
         rho_vtrace = args.rho_vtrace if args.rho_vtrace >= 0 else jnp.inf,

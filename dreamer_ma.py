@@ -159,7 +159,7 @@ class DreamerMA():
 
       #[Trajectory, Batch, num_players, obs_size]
       reconstruction_loss = -get_normal_log_prob(predictions.decoded_obs, timestep.obs, use_symlog=True)
-      dec = get_loss_mean_with_mask(reconstruction_loss, timestep.valid[..., None, None])
+      dec = get_loss_mean_with_mask(reconstruction_loss, timestep.valid[..., None, None], normalization_mult=2)
       l_pred += dec
       #[Trajectory, Batch, 1]
       #continuation_loss = -get_normal_log_prob(predictions.done_logit, timestep.terminal.astype(jnp.int16))
@@ -169,7 +169,7 @@ class DreamerMA():
       #[Trajectory, Batch, players, action_dim]
       legal_loss = optax.sigmoid_binary_cross_entropy(predictions.legal_logit, timestep.legal)
       #Legal actions should not be trained in terminal states, as there are no legal actions there
-      leg = get_loss_mean_with_mask(legal_loss, timestep.valid[..., None, None] & ~timestep.terminal[..., None, None])
+      leg = get_loss_mean_with_mask(legal_loss, timestep.valid[..., None, None] & ~timestep.terminal[..., None, None], normalization_mult=2)
       l_pred += leg
       #[Trajectory, Batch, 2* bin_range + 1]
       bins = jnp.arange((2 * self.wm_config.bin_range) + 1) - self.wm_config.bin_range
@@ -203,13 +203,13 @@ class DreamerMA():
       #These are one-hot encoded. We want to maximize the probability
       # of seeing the previous action, hence making sure the infoset retains information about it
       infoset_prev_action_loss = -get_categorical_log_prob(predictions.infoset_decoded_actions, previous_actions)
-      is_act = get_loss_mean_with_mask(infoset_prev_action_loss, action_loss_mask[..., None, None])
+      is_act = get_loss_mean_with_mask(infoset_prev_action_loss, action_loss_mask[..., None, None], normalization_mult=2)
       #is_act = 0
       l_infoset += is_act
       #Current observation loss, similar intuition as with the previous action
       #Reduces to MSE
       is_obs_loss = -get_normal_log_prob(predictions.infoset_decoded_obs, timestep.obs, use_symlog=True)
-      is_obs = get_loss_mean_with_mask(is_obs_loss, timestep.valid[..., None, None])
+      is_obs = get_loss_mean_with_mask(is_obs_loss, timestep.valid[..., None, None], normalization_mult=2)
       l_infoset += is_obs
       # The current recurrent state prediction loss. This together
       # with the current deter state prediction loss serves to force

@@ -1,11 +1,11 @@
 from argparse import ArgumentParser
+import dataclasses
+import json
 import os
 import time
-import matplotlib.pyplot as plt
-
 from experiments.policy_eval_utils import *
 from experiments.eval_utils import track
-from train_utils import load_model, get_seeds
+from train_utils import load_model, parse_sequence
 
 
 parser = ArgumentParser()
@@ -14,6 +14,8 @@ parser.add_argument("--base_path", type=str, default="trained_networks", help="P
 parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name and parameter string of the game to evaluate for")
 parser.add_argument("--seeds", type=str, default='(42, )', help="Seeds of the stored models to check. Supplied as a string (seed_1, seed_2, ..., seed_n)")
 parser.add_argument("--restore_step", type=int, default=10000, help="Saved step of the model to restore. If checking entire directory, -1 is also supported for all steps")
+parser.add_argument("--algos", type=str, default="NashDreamer RNaD", help="Which algorithms to actually evaluate for.")
+
 
 parser.add_argument("--scale_factor", type=float, default=1.0, help="Scale factor to multiply all rewards by. Useful if the game implementation scaled rewards in a different way than traditional implementations."
                     "Then, this should be the inverse of the game scaling factor. For example, JaxLeduc divides all rewards by 13, so to get values appriopriately scaled as in literature, this should be set to 13.")
@@ -24,6 +26,8 @@ experiment_parsers = parser.add_subparsers(dest="experiment_type", required=True
 
 loaded_parser = experiment_parsers.add_parser(name="loaded", help="Evaluate best responses against particular loaded model, or all models in the directory if restore_step is -1")
 loaded_parser.add_argument("--metric", type=str, default="nash_conv", choices=("nash_conv", "expected_util", "env_return"), help="Type of metric to plot. Either NashConv, expected_utility, or smoothed environment returns during training.")
+loaded_parser.add_argument("--metric_store_dir", type=str, default="metrics/", help="Base path of the directory where to store the extracted metrics. The full path will be metric_store_dir/algo_name/game_name.")
+loaded_parser.add_argument("--algo_dirs", type=str, default="NashDreamer=nash_dreamer_rnad RNaD=rnad", help="Mapping of algorithm names to their directory names under base_path. Space-separated AlgoName=dir_name pairs. Example: 'NashDreamer=nash_dreamer_rnad RNaD=rnad_replayed'")
 
 nash_parser = experiment_parsers.add_parser(name="nash", help="Evaluate expected values of the model, best response values against it and also of a saved reference nash equilibrium strategy.")
 nash_parser.add_argument("--nash_strategy_path", type=str, default="experiments/goofspiel_nash.pkl", help="Path to the saved nash strategy in pickle format. Must be formatted as a tuple of behavioral strategies per tree depth and infoset map per tree_depth.")
@@ -141,36 +145,105 @@ def get_metrics_from_dir(model_dir, args):
         sort_indices = np.argsort(steps)
         sorted_steps = steps[sort_indices]
         batch_size = model.wm_config.batch_size if isinstance(model, DreamerMA) else model.batch_size
-        env_steps = sorted_steps * (batch_size * model.game.max_trajectory_length())
+        ratio = 1 if model.buffer_config.replay_ratio <= 0 else model.buffer_config.replay_ratio
+        env_steps = sorted_steps * ((batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio)
         return env_steps, metrics[sort_indices], game
     else:
         return [], [], game
 
 
+def _config_to_dict(model):
+    """Extract config fields as a JSON-serializable dict based on model type."""
+    if isinstance(model, DreamerMA):
+        return {
+            'wm_config': dataclasses.asdict(model.wm_config),
+            'ac_config': dataclasses.asdict(model.ac_config),
+            'buffer_config': dataclasses.asdict(model.buffer_config),
+            'optimizer_config': dataclasses.asdict(model.opt_config),
+        }
+    elif isinstance(model, SimRNaD):
+        return {
+            'config': dataclasses.asdict(model.config),
+            'buffer_config': dataclasses.asdict(model.buffer_config),
+        }
+    return {}
+
+
+def extract_config_from_dir(model_dir, restore_step):
+    """Load one checkpoint from model_dir and return its config as a dict."""
+    if not model_dir.startswith("/"):
+        model_dir = os.path.join(os.getcwd(), model_dir)
+    if not os.path.exists(model_dir):
+        return None
+    files = sorted(f for f in os.listdir(model_dir) if f.endswith(".pkl"))
+    for filename in files:
+        step = int(filename.split("_")[-1].split(".")[0])
+        if restore_step >= 0 and step != restore_step:
+            continue
+        model = load_model(os.path.join(model_dir, filename))
+        return _config_to_dict(model)
+    return None
+
+
+def save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, plotting_names, args):
+    """Save extracted metrics to text files under metric_store_dir/algo_name/game_name/metric.txt.
+    Also saves a config.json in the same directory when config data is available."""
+    for algo_name, seed_data in results.items():
+        save_dir = os.path.join(args.metric_store_dir, algo_name, args.game_name)
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, f"{args.metric}.txt")
+        with open(filepath, 'w') as f:
+            f.write(f"algo_name: {plotting_names[algo_name]}\n")
+            f.write(f"game_name: {args.game_name}\n")
+            f.write(f"game_str: {game_str}\n")
+            f.write(f"metric: {args.metric}\n")
+            f.write(f"smoothing_window: {smoothing_window}\n")
+            if uniform_nash_conv is not None:
+                f.write(f"uniform_nash_conv: {uniform_nash_conv}\n")
+            for seed, (steps, metrics) in seed_data.items():
+                f.write(f"seed: {seed}\n")
+                f.write("steps: " + " ".join(str(s) for s in steps) + "\n")
+                f.write("values: " + " ".join(str(v) for v in metrics) + "\n")
+        print(f"Metrics for {algo_name} saved to {filepath}")
+        if algo_name in algo_configs:
+            config_path = os.path.join(save_dir, "config.json")
+            with open(config_path, 'w') as f:
+                json.dump(algo_configs[algo_name], f, indent=2)
+            print(f"Config for {algo_name} saved to {config_path}")
+
+
 def plot_comparison(args):
     """
-    Main function to plot NashDreamer vs RNaD for a specific game.
+    Main function to extract metrics for NashDreamer vs RNaD for a specific game
+    and save them to disk.
     """
     base_path = args.base_path
-    game_path = args.game_name 
-    seeds = get_seeds(args.seeds)
+    game_path = args.game_name
+    seeds = parse_sequence(args.seeds)
     seed_paths = [f"seed_{s}" for s in seeds]
-    
-    # Define the two algorithms to compare
+
+    # Parse algo_dirs: "AlgoName=dir_name ..." -> {"AlgoName": "dir_name", ...}
+    algo_dir_map = dict(pair.split("=", 1) for pair in args.algo_dirs.split())
+
+    # Define the algorithms to compare, using the mapped directory names
     algos = {
-        "NashDreamer": [os.path.join(base_path, "nash_dreamer_rnad", game_path, p) for p in seed_paths],
-        "RNaD": [os.path.join(base_path, "rnad", game_path, p) for p in seed_paths]
+        algo_name: [os.path.join(base_path, dir_name, game_path, p) for p in seed_paths]
+        for algo_name, dir_name in algo_dir_map.items()
     }
-    
-    results = {k: {} for k in algos}
+    names = {v: k for k, v in algo_dir_map.items()}
+    algos = {algo_dir_map[k]: v for k, v in algos.items() if k in args.algos}
+    print(f"Evaluating for {algos}")
+
+    results = {v: {} for k, v in algo_dir_map.items()}
+    algo_configs = {}
     game_str = ""
     game = None
     smoothing_window = -1
     max_steps = 0
-    
+
     def metrics_wrapper(directory, args):
-        """Just a wrapper function to 
-        handle the interface discrepancy between 
+        """Just a wrapper function to
+        handle the interface discrepancy between
         the environment returns, and game theoretic metric
         computation."""
         if args.metric == 'env_return':
@@ -183,11 +256,15 @@ def plot_comparison(args):
         return steps, metrics, game, game_str, smoothing_window
 
 
-    
+
     # 1. Collect Data
     for algo_name, dir_paths in algos.items():
         for s, d in zip(seeds,dir_paths):
             steps, metrics, game, new_game_str, new_smoothing_window = metrics_wrapper(d, args)
+            if algo_name not in algo_configs and args.metric != 'env_return':
+                config = extract_config_from_dir(d, args.restore_step)
+                if config:
+                    algo_configs[algo_name] = config
             if steps is not None and len(steps) > 0:
                 max_steps = max(max_steps, len(steps))
                 results[algo_name][s] = (steps, metrics)
@@ -198,7 +275,7 @@ def plot_comparison(args):
                     assert new_game_str == game_str, f"Expected all models to use the same game {game_str}. Found {new_game_str} for algorithm {algo_name} seed {s} instead!"
                 #Check if all experiments
                 # used the same smoothing window
-                # (relevant for the environment returns only) 
+                # (relevant for the environment returns only)
                 if smoothing_window < 0:
                     smoothing_window = new_smoothing_window
                 else:
@@ -208,103 +285,16 @@ def plot_comparison(args):
         print("No data found for either algorithm.")
         return
 
-    # 2. Plotting
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    x_name = "Gradient steps"
-
-    if args.metric == 'nash_conv':
-        metric_str = "NashConv"
-        plot_str = "nash_conv"
-    elif args.metric == 'expected_util':
-        metric_str = "Expected Utility"
-        plot_str = "expected_utility"
-    else:
-        metric_str = f"Env returns smoothed with a {smoothing_window} window"
-        plot_str = f"env_return_window_{smoothing_window}"
-    
-    # Plot Algorithm Curves
-    colors = {'NashDreamer': 'tab:red', 'RNaD': 'tab:blue'}
-    
-    for algo_name, seed_data in results.items():
-        if not seed_data:
-            continue
-            
-        # seed_data is {seed: (steps, metrics)}
-        # We need to aggregate them.
-        
-        # Assumption: All seeds have the same steps. 
-        # If not, we take the intersection or reference the first one.
-        first_seed = list(seed_data.keys())[0]
-        ref_steps = seed_data[first_seed][0] 
-        
-        # Create list of metric arrays
-        stacked_metrics = []
-        for s, (steps, metrics) in seed_data.items():
-            if np.array_equal(steps, ref_steps):
-                stacked_metrics.append(metrics)
-            else:
-                print(f"Warning: Step mismatch for {algo_name} seed {s}. Skipping aggregation for this seed.")
-        
-        if not stacked_metrics:
-            continue
-
-        # Convert to matrix: (N_seeds, N_steps)
-        matrix = np.vstack(stacked_metrics)
-        
-        # Calculate Statistics
-        mean = np.mean(matrix, axis=0)
-        
-        # Plot Mean Line
-        color = colors.get(algo_name, 'black')
-        for i in range(matrix.shape[0]):
-            ax.plot(ref_steps, matrix[i], 
-                    color=color, 
-                    alpha=0.3,       # Make it faint
-                    linestyle='--',   # Dotted/Dashed line
-                    linewidth=1)      # Thinner line
-
-        # 2. Plot Mean Line
-        # We plot this LAST so it appears on top of the individual seeds.
-        # We add the label here so it appears in the legend once.
-        ax.plot(ref_steps, mean,
-                #label="Smoothed returns with rolling average over 32 trajectories",
-                #color='blue', 
-                label=algo_name, 
-                color=color,
-                linestyle='-', 
-                linewidth=2.5)    # Thicker, solid line
-
-    # Plot Uniform Baseline (Dashed Line)
+    # 2. Compute uniform nash conv baseline before saving (requires game object)
+    uniform_nash_conv = None
     if args.metric == "nash_conv" and game:
         #Using the overloaded functionality of extract model policy
         # to get uniform policy for the game
         uniform_policy = extract_model_policy(None, game, uniform=True)
         uniform_nash_conv = args.scale_factor * nash_conv(None, game, uniform_policy)
-        ax.axhline(y=uniform_nash_conv, xmin=0, xmax=max_steps, color='orange', linestyle='--', label="Uniform Policy", alpha=0.7)
 
-    # Styling
-    ax.legend(fontsize=15)
-    ax.set_xlabel("Environment steps", fontsize=15)
-    #ax.set_xscale('log')
-    ax.set_ylabel(metric_str)
-    #ax.set_ylabel("Episode return", fontsize=15)
-    ax.set_title(f"Comparison {metric_str} on {args.game_name}", fontsize=20)
-    #ax.set_title(f"NashDreamer obtained returns", fontsize=20)
-    ax.grid(True, alpha=0.3)
-    
-    # if args.metric == "nash_conv":
-    #     ax.set_yscale("log")
-
-    # Save
-    save_dir = f"plots/comparison/{game_path}"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-        
-    filename = f"{plot_str}_comparison.pdf"
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, filename))
-    print(f"Plot saved to {os.path.join(save_dir, filename)}")
+    # 3. Save metrics
+    save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, names, args)
 
 def test_nash(args, saved_nash_path: str):
   model_path = args.model_dir

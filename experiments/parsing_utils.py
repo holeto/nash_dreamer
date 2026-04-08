@@ -89,8 +89,8 @@ def add_rnad_arguments(parser: ArgumentParser) ->ArgumentParser:
   ##RNaD parameters  
   parser.add_argument("--eta", type=float, default=0.2, help="Strenght of the regularization in RNaD. Used for the reward transformation and the KL regularization for V-trace.")
   ##Entropy schedule- network switching
-  parser.add_argument("--entropy_schedule_size", default=(100, 2000), help="Defines how many iterations should be done for each item in the sequence.")
-  parser.add_argument("--entropy_schedule_repeats", default=(10, 1), help="Defines amount of network switching sequences for each item in the sequence. Make sure last element is 1. For details see the EntropySchedule class.")
+  parser.add_argument("--entropy_schedule_size", default='(100, 1000)', help="Defines how many iterations should be done for each item in the sequence.")
+  parser.add_argument("--entropy_schedule_repeats", default='(10, 1)', help="Defines amount of network switching sequences for each item in the sequence. Make sure last element is 1. For details see the EntropySchedule class.")
 
   ##V-Trace paraemters
   parser.add_argument("--rho_vtrace", type=float, default=-1.0, help="Rho clipping parameter for V-Trace. If < 0 treated as infinity (no clipping)")

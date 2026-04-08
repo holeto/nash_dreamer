@@ -154,7 +154,7 @@ class RNaDDreamer():
 
         # The multiplication by -1 is critical here, otherwise we would
         # be minimizing the neurd term, but we want to maximize it.
-        neurd_loss_value = -get_loss_mean_with_mask(loss_neurd, expanded_valid)
+        neurd_loss_value = -get_loss_mean_with_mask(loss_neurd, expanded_valid, normalization_mult=2)
       else:
         neurd_loss_value = 0
       #jax.debug.breakpoint()

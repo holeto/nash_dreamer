@@ -45,7 +45,6 @@ class JaxLeduc(JaxGame):
     #there are 4 cards left in the deck
     #self.public_chance_outcomes = 4
     #self.chance_outcomes = 120
-    #JAX constants TODO: Probably put this somewhere else
     self.invalid_action_mask = jax.nn.one_hot(INVALID_ID, self.num_actions)
 
   

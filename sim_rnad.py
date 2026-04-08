@@ -17,7 +17,7 @@ from games.jax_game import JaxGame, GameState
 from ma_rssm import *
 from train_utils import *
 from replay_buffer import ActorReplayBuffer
-from distributions import get_bin_log_prob
+from distributions import get_bin_log_prob, get_normal_log_prob
 
 from optimizer import make_opt
 
@@ -394,8 +394,10 @@ class SimRNaD():
       joint_obs = jnp.reshape(obs, (*obs.shape[:-2], -1))
 
       v_dist_logits = vectorized_critic_apply(rnad_network.critic, joint_obs)
+      #v = vectorized_critic_apply(rnad_network.critic, joint_obs)
 
       v_target_dist_logits = vectorized_critic_apply(target_network, joint_obs)
+      #v_target = vectorized_critic_apply(target_network, joint_obs)
       _, log_pi_prev, _ = vectorized_net_apply(prev_network, obs, timestep.legal)
       _, log_pi_prev_, _ = vectorized_net_apply(_prev_network, obs, timestep.legal)
        
@@ -422,15 +424,20 @@ class SimRNaD():
       importance_sampling = jnp.flip(importance_sampling, axis=-2)
       #importance_sampling = 1.0
 
+      #The bin categorical loss
       v_loss = -get_bin_log_prob(v_dist_logits, bins, jax.lax.stop_gradient(v_train_target))
+      # L2 loss
+      #v_loss = -get_normal_log_prob(v, jax.lax.stop_gradient(v_train_target), use_symlog=False)
       v_loss_value = get_loss_mean_with_mask(v_loss, timestep.valid[..., None])
 
       loss_neurd = neurd_loss(logit, pi, q_value, timestep.legal, importance_sampling,
                                 self.config.neurd_clip, self.config.neurd_threshold)
 
+      #Each player acts, so the normalization for the NeURD loss 
+      # should be multiplied by 2 to get the true mean.
       # The multiplication by -1 is critical here, otherwise we would
       # be minimizing the neurd term, but we want to maximize it.
-      neurd_loss_value = -get_loss_mean_with_mask(loss_neurd, expanded_valid)
+      neurd_loss_value = -get_loss_mean_with_mask(loss_neurd, expanded_valid, normalization_mult=2)
       return v_loss_value + neurd_loss_value, {'val': v_loss_value, 'policy': neurd_loss_value}
                                   
 

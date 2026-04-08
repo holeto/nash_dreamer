@@ -49,6 +49,9 @@ class BufferTimeStep():
     self.terminal[indices] = value.terminal
     self.valid[indices] = value.valid
 
+  def __len__(self):
+    return self.obs.shape[0]
+
 @dataclass
 class BufferActorStep():
   """Same structure as ActorCriticTimeStep, only
@@ -76,6 +79,9 @@ class BufferActorStep():
     self.policy[indices] = value.policy
     self.reward[indices] = value.reward
     self.valid[indices] = value.valid
+
+  def __len__(self):
+    return self.obs.shape[0]
 
 
 class ReplayBuffer():
@@ -233,19 +239,21 @@ class ReplayBuffer():
       self.buffer_index = 0
       self.full = True
 
-  def store_batch(self, batch_trajectories: BufferTimeStep | BufferActorStep):
+  def store_batch(self, batch_trajectories: TimeStep| ActorCriticTimeStep):
     buffer_timestep = self.env_to_buffer_timestep(batch_trajectories)
+    batch_size = len(buffer_timestep)
+    #Assuming one reward per trajectory
     rewards = np.sum(buffer_timestep.reward, axis=1)
-    if self.batch_size + self.smoothing_idx < self.config.smoothing_window:
-      self.smoothing_rewards[self.smoothing_idx: self.smoothing_idx + self.batch_size] = rewards
-      self.smoothing_idx += self.batch_size
-    elif self.config.smoothing_window <= self.batch_size:
+    if batch_size + self.smoothing_idx < self.config.smoothing_window:
+      self.smoothing_rewards[self.smoothing_idx: self.smoothing_idx + batch_size] = rewards
+      self.smoothing_idx += batch_size
+    elif self.config.smoothing_window <= batch_size:
       self.smoothing_rewards = rewards[-self.config.smoothing_window:]
       self.smoothing_full = True
     else:
       space_left = self.config.smoothing_window - self.smoothing_idx
       self.smoothing_rewards[self.smoothing_idx:] = rewards[:space_left]
-      remaining_items = self.batch_size - space_left
+      remaining_items = batch_size - space_left
       self.smoothing_rewards[:remaining_items] = rewards[space_left:]
       self.smoothing_idx = remaining_items
       self.smoothing_full = True
@@ -255,7 +263,7 @@ class ReplayBuffer():
           self.smoothed_returns.append(self.smoothing_rewards.mean())
         else:
           self.smoothed_returns.append(self.smoothing_rewards[:self.smoothing_idx].mean())
-    for i in range(self.batch_size):
+    for i in range(batch_size):
       self.add_single(buffer_timestep[i])
   
   def mixed_sample(self, env_sample_key: chex.Array):

@@ -78,8 +78,10 @@ class CriticNetwork(nnx.Module):
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
     #Initialize the value output layer to all zeros, as per
     # https://arxiv.org/pdf/2301.04104 page 6
+    #The binary categorical head
     self.value_head = nnx.Linear(hidden_features, (2 * bin_range + 1), rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
-  
+    #L2 head
+    #self.value_head = nnx.Linear(hidden_features, 1, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
   def __call__(self, input):
     x = self.init_layer(input)
     x = self.core_mlp(x)

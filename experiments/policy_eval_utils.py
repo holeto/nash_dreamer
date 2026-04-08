@@ -3,10 +3,12 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
+import chex
 import flax.nnx as nnx
 
 
-from train_utils import uniform_policy
+from train_utils import uniform_policy, symlog
+from networks import ActorNetwork
 from experiments.eval_utils import cartesian_product, stringify, find_closest_index, create_infoset_map, unroll_chance_node
 
 
@@ -15,7 +17,7 @@ from games.jax_game import JaxGame, GameState
 from games.model_game import DreamerModelGame, ModelGameState
 
 from dreamer_ma import DreamerMA
-from sim_rnad import SimRNaD
+from sim_rnad import SimRNaD, ACNetwork
 from ma_rssm import MARSSM
 
 def extract_model_policy(model: DreamerMA|SimRNaD|None, game: JaxGame | DreamerModelGame, uniform=False)-> tuple[list, list]:
@@ -478,3 +480,142 @@ def nash_conv(model: DreamerMA, game: JaxGame | DreamerModelGame, custom_policy:
   """
   p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game, custom_policy=custom_policy)
   return p1_br_val + p2_br_val
+
+
+def head_to_head_play(game: JaxGame, model_a: MARSSM | ACNetwork, model_b: MARSSM | ACNetwork,
+                      num_games: int, key, epsilon: float = 0.0, chunk_size: int = 1024) -> chex.Array:
+  """Play num_games games between two models and return per-game total rewards.
+
+  Games are played in chunks of chunk_size to avoid OOM with large num_games.
+  Model A controls player 0, model B controls player 1.
+  Supports MARSSM (with real or latent infosets) and ACNetwork (always real infosets).
+  Returns array of shape [num_games] with total reward per game
+  from player 0 (model A) perspective.
+  """
+  actions = game.num_distinct_actions()
+  trajectory_max = game.max_trajectory_length()
+
+  game_state, legal_actions = game.initialize_structures()
+
+  is_marssm_a = isinstance(model_a, MARSSM)
+  is_marssm_b = isinstance(model_b, MARSSM)
+  use_real_a = model_a.use_real_infoset if is_marssm_a else True
+  use_real_b = model_b.use_real_infoset if is_marssm_b else True
+
+  latent_dim_a = model_a.latent_infoset_size if is_marssm_a else 1
+  latent_dim_b = model_b.latent_infoset_size if is_marssm_b else 1
+  init_infoset_a = jnp.zeros((latent_dim_a,))
+  init_infoset_b = jnp.zeros((latent_dim_b,))
+  dummy_action = jnp.zeros((actions,))
+
+  @chex.dataclass(frozen=True)
+  class PlayCarry:
+    game_state: GameState
+    legal_actions: chex.Array
+    terminal: chex.Array
+    total_reward: chex.Array
+    latent_infoset_a: chex.Array
+    prev_action_a: chex.Array
+    latent_infoset_b: chex.Array
+    prev_action_b: chex.Array
+
+  init_carry = PlayCarry(
+    game_state=game_state,
+    legal_actions=legal_actions,
+    terminal=jnp.array(False),
+    total_reward=jnp.array(0.0),
+    latent_infoset_a=init_infoset_a,
+    prev_action_a=dummy_action,
+    latent_infoset_b=init_infoset_b,
+    prev_action_b=dummy_action,
+  )
+
+  @nnx.jit
+  def choice_wrapper(key, p):
+    action = jax.random.choice(key, actions, p=p)
+    action_oh = jax.nn.one_hot(action, actions)
+    return action, action_oh
+
+  vectorized_sample_action = nnx.vmap(choice_wrapper, in_axes=(0, 0), out_axes=0)
+
+  @nnx.scan(in_axes=(nnx.Carry, None, None, 0), out_axes=(nnx.Carry, 0))
+  def _play_step(carry: PlayCarry, model_a: MARSSM | ACNetwork, model_b: MARSSM | ACNetwork, key):
+    action_key, chance_key = jax.random.split(key, 2)
+
+    _, p1_infoset, p2_infoset, _ = game.get_info(carry.game_state)
+    obs = jnp.stack((p1_infoset, p2_infoset), axis=0)
+
+    # Update latent infosets (only for MARSSM models that use them)
+    if is_marssm_a and not use_real_a:
+      new_latent_a = model_a.get_next_infoset_no_jit(carry.latent_infoset_a, obs[0], carry.prev_action_a)
+    else:
+      new_latent_a = carry.latent_infoset_a
+
+    if is_marssm_b and not use_real_b:
+      new_latent_b = model_b.get_next_infoset_no_jit(carry.latent_infoset_b, obs[1], carry.prev_action_b)
+    else:
+      new_latent_b = carry.latent_infoset_b
+
+    # Actor A controls player 0
+    if use_real_a:
+      pi_a = model_a.actor(symlog(obs[0]), carry.legal_actions[0])[0]
+    else:
+      pi_a = model_a.actor(new_latent_a, carry.legal_actions[0])[0]
+
+    # Actor B controls player 1
+    if use_real_b:
+      pi_b = model_b.actor(symlog(obs[1]), carry.legal_actions[1])[0]
+    else:
+      pi_b = model_b.actor(new_latent_b, carry.legal_actions[1])[0]
+
+    pi = jnp.stack([pi_a, pi_b], axis=0)
+
+    normalization = jnp.sum(carry.legal_actions, axis=-1, keepdims=True)
+    uniform_pi = carry.legal_actions / (normalization + (normalization == 0))
+    pi = epsilon * uniform_pi + (1 - epsilon) * pi
+
+    is_chance = game.is_chance(carry.game_state)
+    action_key = jax.random.split(action_key, game.num_players())
+    action, action_oh = vectorized_sample_action(action_key, pi)
+
+    def apply_action():
+      return game.apply_action(carry.game_state, action)
+
+    def sample_chance():
+      outcomes, probs = game.get_outcomes_and_probs(carry.game_state)
+      probs = jnp.where(is_chance, probs, jnp.ones_like(probs) / probs.shape[0])
+      chosen_outcome = jax.random.choice(chance_key, outcomes, p=probs)
+      return game.apply_action(carry.game_state, chosen_outcome)
+
+    next_game_state, next_terminal, next_reward, next_legal = jax.lax.cond(
+        is_chance, sample_chance, apply_action)
+
+    next_terminal = jnp.logical_or(carry.terminal, next_terminal)
+    total_reward = carry.total_reward + jnp.where(carry.terminal, 0.0, next_reward)
+
+    new_carry = PlayCarry(
+      game_state=next_game_state,
+      legal_actions=jnp.where(next_terminal, legal_actions, next_legal),
+      terminal=next_terminal,
+      total_reward=total_reward,
+      latent_infoset_a=new_latent_a,
+      prev_action_a=action_oh[0],
+      latent_infoset_b=new_latent_b,
+      prev_action_b=action_oh[1],
+    )
+    return new_carry, None
+
+  def _play_single_game(model_a, model_b, key):
+    trajectory_keys = jax.random.split(key, trajectory_max)
+    final_carry, _ = _play_step(init_carry, model_a, model_b, trajectory_keys)
+    return final_carry.total_reward
+
+  batch_play = nnx.vmap(_play_single_game, in_axes=(None, None, 0), out_axes=0)
+
+  game_keys = jax.random.split(key, num_games)
+  all_rewards = []
+  for i in range(0, num_games, chunk_size):
+    chunk_keys = game_keys[i:i + chunk_size]
+    chunk_rewards = batch_play(model_a, model_b, chunk_keys)
+    all_rewards.append(chunk_rewards)
+  return jnp.concatenate(all_rewards, axis=0)

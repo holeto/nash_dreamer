@@ -286,13 +286,13 @@ def apply_force_with_threshold(decision_outputs: chex.Array, force: chex.Array,
   return decision_outputs * jax.lax.stop_gradient(clipped_force)
 
 
-def get_loss_mean_with_mask(loss: chex.Array, mask: chex.Array) -> chex.Array:
+def get_loss_mean_with_mask(loss: chex.Array, mask: chex.Array, normalization_mult=1) -> chex.Array:
   """Mask a loss using mask and compute its mean, 
   such that elements with 0 in the mask are correctly ignored.
     Ensure loss and mask are of broadcastable shape. """
+  normalization_factor = jnp.sum(mask) * normalization_mult
   broadcasted_mask = jnp.zeros(loss.shape, mask.dtype) + mask
   masked_loss = loss * broadcasted_mask
-  normalization_factor = jnp.sum(broadcasted_mask)
   summed_loss = jnp.sum(masked_loss)
   return summed_loss / (normalization_factor + (normalization_factor == 0))
 
@@ -385,27 +385,27 @@ def load_model(path:str):
     return pickle.load(f)
   
   
-def get_seeds(seed_spec:str) ->list[int]:
-  """A helper utility to parse seeds
-  as a list of integers from the string specification
+def parse_sequence(str_spec:str) ->list[int]:
+  """A helper utility to parse
+  a list of integers from the string specification
 
   Args:
       seeds (str): A string specification of the 
-      seeds to be used of form (seed_1, seed_2, ... , seed_n)
+      sequence to be used of form (num_1, num_2, num_N)
 
   Returns:
-      list[int]: A list of the integer parsed seeds.
+      list[int]: A list of the integer parsed sequence.
   """
-  assert seed_spec.startswith('(') and seed_spec.endswith(')'), f"Invalid seed specification {seed_spec}"
-  seed_spec = seed_spec.strip('()').split(',')
-  seeds = []
-  for s in seed_spec:
+  assert str_spec.startswith('(') and str_spec.endswith(')'), f"Invalid string specification {str_spec}"
+  str_spec = str_spec.strip('()').split(',')
+  seq = []
+  for s in str_spec:
     if not s.strip().isdecimal():
       continue
-    seed = int(s)
-    if seed == -1:
-      seed = np.random.randint(0, 2**32 - 1)
-    seeds.append(seed)
-  assert len(seeds) > 0, f"No valid seed was found in the provided specification {seed_spec}"
-  return seeds
+    num = int(s)
+    if num < 0:
+      num = np.random.randint(0, 2**32 - 1)
+    seq.append(num)
+  assert len(seq) > 0, f"No valid integer was found in the provided specification {str_spec}"
+  return seq
   
