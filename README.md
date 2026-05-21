@@ -145,15 +145,15 @@ python -m experiments.leduc_train nash_dreamer \
 
 ## Evaluation
 
-### Nash convergence and policy quality
+### NashConv and policy quality
 
-Evaluates Nash convergence (`nash_conv`), expected utility (`expected_util`), or smoothed training returns (`env_return`) for one or more algorithms across seeds:
+Evaluates NashConv (`nash_conv`), expected utility (`expected_util`), or smoothed training returns (`env_return`) for one or more algorithms across seeds:
 
 ```bash
 # Evaluate NashDreamer and RNaD on Goofspiel-3 at step 10 000 (default)
 ./nash_dreamer_evaluate.sh
 
-# Evaluate on Leduc Poker, Nash convergence metric
+# Evaluate on Leduc Poker, NashConv metric
 GAME_NAME="leduc" METRIC="nash_conv" SCALE_FACTOR=13 ./nash_dreamer_evaluate.sh
 
 # Or call directly:
