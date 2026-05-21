@@ -340,6 +340,169 @@ class JaxLeduc(JaxGame):
 
     return new_game_state, terminal, reward[0], new_legals
   
+class JaxLeducRound1(JaxLeduc):
+  """One-round Leduc poker: game ends after round-1 betting (no public card / round 2)."""
+
+  def __init__(self, max_raises: int = 2):
+    super().__init__()
+    self.max_raises_per_round = max_raises
+    # 0 raises: action_history still needs ≥1 row for JAX shape consistency
+    self.max_turns = max(2, 2 + max_raises)
+    self.max_bet_amount = 1 + max_raises * self.raise_amount  # 0→1, 1→3, 2→5
+
+  def game_name(self):
+    return "leduc_round1"
+
+  def params_dict(self):
+    return {'max_raises': self.max_raises_per_round}
+
+  def max_trajectory_length(self):
+    return self.max_turns + 2  # 1 private-card chance + turns + 1 terminal
+
+  def max_trajectory_lenght_no_chance(self):
+    return self.max_turns + 1  # turns + terminal
+
+  def depth_chance_outcomes(self, depth: int):
+    return self.private_chance_outcomes if depth == 0 else 1
+
+  def depth_chance_valid_outcomes(self, depth: int):
+    return self.private_chance_outcomes if depth == 0 else 1
+
+  def public_state_tensor_shape(self):
+    # No public card one-hot — only action history
+    return self.max_turns * (self.num_actions - 1)
+
+  @functools.partial(jax.jit, static_argnums=(0))
+  def get_info(self, game_state: LeducGameState):
+    public_state_tensor = game_state.action_history.ravel()
+    public_state_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(public_state_tensor), public_state_tensor)
+    private_cards_oh = jax.nn.one_hot(game_state.private_cards, self.total_cards)
+    p1_player = jax.nn.one_hot(0, 2)
+    p1_infoset_tensor = jnp.concatenate([p1_player.ravel(), private_cards_oh[0], public_state_tensor])
+    p1_infoset_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(p1_infoset_tensor), p1_infoset_tensor)
+    p2_infoset_tensor = jnp.concatenate([1 - p1_player.ravel(), private_cards_oh[1], public_state_tensor])
+    p2_infoset_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(p2_infoset_tensor), p2_infoset_tensor)
+    state_tensor = jnp.concatenate([private_cards_oh.ravel(), public_state_tensor])
+    state_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(state_tensor), state_tensor)
+    return state_tensor, p1_infoset_tensor, p2_infoset_tensor, public_state_tensor
+
+  @functools.partial(jax.jit, static_argnums=(0))
+  def apply_action_chance(self, game_state: LeducGameState, actions: chex.Array):
+    # Only the private-card chance node exists in one-round Leduc.
+    outcomes, legals, _ = self.generate_all_private_card_nodes(game_state)
+    action_oh = jax.nn.one_hot(actions[1], self.private_chance_outcomes)
+    outcome = jax.tree_util.tree_map(
+        lambda x: jnp.sum(x * jnp.reshape(action_oh, (action_oh.shape[0],) + (1,) * len(x.shape[1:])), axis=0),
+        outcomes)
+    legals = jnp.sum(action_oh[..., None, None] * legals, axis=0)
+    if self.max_raises_per_round == 0:
+      # No betting round: resolve immediately by private card rank.
+      # self is static so this branch is chosen at JIT trace time.
+      player_card_types = jnp.floor_divide(outcome.private_cards, 2)
+      tie = jnp.all(jnp.isclose(player_card_types[0], player_card_types[1]))
+      winner = jnp.argmax(player_card_types)
+      reward = jnp.where(tie, jnp.array(0.0),
+                         ((1.0 - 2.0 * winner) * outcome.current_chips[1 - winner])
+                         / self.max_bet_amount).astype(jnp.float32)
+      terminal = jnp.array(True)
+      new_game_state = LeducGameState(
+          action_history=outcome.action_history,
+          public_card=outcome.public_card.astype(jnp.int16),
+          private_cards=outcome.private_cards.astype(jnp.int16),
+          current_chips=outcome.current_chips.astype(jnp.int16),
+          turns_this_round=outcome.turns_this_round.astype(jnp.int16),
+          terminal=terminal,
+          turn=outcome.turn.astype(int),
+          is_chance=jnp.array(False))
+      return new_game_state, terminal, reward, legals
+    new_game_state = LeducGameState(
+        action_history=outcome.action_history,
+        public_card=outcome.public_card.astype(jnp.int16),
+        private_cards=outcome.private_cards.astype(jnp.int16),
+        current_chips=outcome.current_chips.astype(jnp.int16),
+        turns_this_round=outcome.turns_this_round.astype(jnp.int16),
+        terminal=outcome.terminal.astype(bool),
+        turn=outcome.turn.astype(int),
+        is_chance=outcome.is_chance.astype(bool))
+    return new_game_state, jnp.array(False), jnp.array(0, dtype=jnp.float32), legals
+
+  @functools.partial(jax.jit, static_argnums=(0))
+  def apply_action_no_chance(self, game_state: LeducGameState, actions: chex.Array):
+    oh_actions = jax.nn.one_hot(actions, self.num_actions)
+    oh_turn = jax.nn.one_hot(game_state.turn, self.max_turns)
+    fold_oh = jax.nn.one_hot(FOLD_ID, self.num_actions)
+    raise_oh = jax.nn.one_hot(RAISE_ID, self.num_actions)
+
+    current_player = game_state.turns_this_round % 2
+    max_chips = jnp.max(game_state.current_chips)
+    oh_valid_action = jax.nn.one_hot(actions[current_player] - 1, self.num_actions - 1)
+
+    # Winner by private card rank only (no public card matching)
+    player_card_types = jnp.floor_divide(game_state.private_cards, 2)
+    folded = jnp.any(oh_actions[current_player] * fold_oh)
+    raised = jnp.sum(oh_actions * raise_oh, axis=1)
+    tie = jnp.all(jnp.isclose(player_card_types[0], player_card_types[1]))
+    winner = jnp.argmax(player_card_types)
+    winner = jnp.where(folded, 1 - current_player, winner)
+
+    this_turn_played = oh_valid_action * oh_turn[..., None]
+    action_history = game_state.action_history + this_turn_played
+
+    num_raises = jnp.where(game_state.turn > 0,
+                            action_history[game_state.turn - 1, RAISE_ID - 1] + raised[current_player], 0)
+
+    action_chips = jnp.concatenate([
+        jnp.repeat(game_state.current_chips[..., None], 2, axis=1),
+        jnp.array([max_chips, max_chips])[..., None] * jnp.ones(2)], axis=1)
+    current_chips = jnp.sum(action_chips * oh_actions, axis=1)
+    current_chips = current_chips + raised * self.raise_amount
+
+    bets_equal = jnp.all(jnp.isclose(current_chips[0], current_chips[1]))
+
+    new_acting_legals = jnp.ones(self.num_actions) - self.invalid_action_mask
+    new_acting_legals = jnp.where(num_raises < self.max_raises_per_round,
+                                  new_acting_legals, new_acting_legals - raise_oh)
+    new_acting_legals = jnp.where(bets_equal, new_acting_legals - fold_oh, new_acting_legals)
+    next_player = (game_state.turns_this_round + 1) % 2
+    new_legals = jnp.where(
+        next_player == 0,
+        jnp.stack([new_acting_legals, self.invalid_action_mask], axis=0),
+        jnp.stack([self.invalid_action_mask, new_acting_legals], axis=0))
+
+    # Terminal: fold, or bets equal after at least one exchange (turns_this_round >= 1)
+    terminal = jnp.logical_or(folded,
+                               jnp.logical_and(game_state.turns_this_round >= 1, bets_equal))
+    terminal = jnp.squeeze(terminal)
+
+    reward = jnp.where(terminal,
+                       jnp.where(jnp.logical_and(tie, ~folded), 0,
+                                 ((1 - 2 * winner) * current_chips[1 - winner]) / self.max_bet_amount),
+                       0)
+    terminal = jnp.logical_or(game_state.terminal, terminal)
+
+    new_game_state = LeducGameState(
+        action_history=action_history,
+        public_card=game_state.public_card.astype(jnp.int16),
+        private_cards=game_state.private_cards.astype(jnp.int16),
+        current_chips=current_chips.astype(jnp.int16),
+        turns_this_round=(game_state.turns_this_round + 1).astype(jnp.int16),
+        terminal=terminal.astype(bool),
+        turn=game_state.turn + 1,
+        is_chance=jnp.array(False))
+    return new_game_state, terminal, reward[0], new_legals
+
+  @functools.partial(jax.jit, static_argnums=(0))
+  def get_outcomes_and_probs(self, game_state: LeducGameState):
+    outcomes = jnp.stack([jax.nn.one_hot(0, self.private_chance_outcomes),
+                          jnp.arange(self.private_chance_outcomes)], axis=-1)
+    probs = jax.lax.cond(
+        game_state.is_chance,
+        lambda s: jnp.ones(self.private_chance_outcomes) / self.private_chance_outcomes,
+        lambda s: jnp.zeros(self.private_chance_outcomes),
+        game_state)
+    return outcomes, probs
+
+
 def main():
   game = JaxLeduc()
   def _tree_walk(state: LeducGameState, legals, terminal, depth=0):

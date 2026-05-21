@@ -1,8 +1,7 @@
-
 from games.jax_point_card_matching import PointCardMatching, PointCardMatchingStochastic
+from experiments.joint_train import train_nash_dreamer
+from experiments.rnad_train import train_rnad
 from experiments.parsing_utils import prepare_experiment_parser
-
-from experiments.joint_train import train
 
 parser = prepare_experiment_parser()
 # Game parameters
@@ -14,8 +13,14 @@ parser.add_argument("--chance_turn_before_terminal", type=int, default=1, help="
 
 def main():
   args = parser.parse_args()
-  game = PointCardMatchingStochastic(args.num_cards, chance_turn_before_terminal=args.chance_turn_before_terminal) if args.stochastic else PointCardMatching(args.num_cards)
-  train(args, game)
+  if args.stochastic:
+    game = PointCardMatchingStochastic(num_cards=args.num_cards, chance_turn_before_terminal=args.chance_turn_before_terminal)
+  else:
+    game = PointCardMatching(num_cards=args.num_cards)
+  if args.experiment_type == 'nash_dreamer':
+    train_nash_dreamer(args, game)
+  else:
+    train_rnad(args, game)
 
 if __name__ == "__main__":
   main()

@@ -120,14 +120,14 @@ class DreamerMA():
         deterministic_state = sample_categorical(stochastic_state, cur_key)
         prior_stochastic_state = model.get_dynamics_no_jit(recurrent_state)
         prior_stochastic_state = add_uniform_mix(prior_stochastic_state, self.wm_config.uniform_mix)
-        decoded_obs = model.get_decoder_no_jit(recurrent_state, deterministic_state, use_symexp=False)
+        decoded_obs = model.get_decoder_no_jit(recurrent_state, deterministic_state, return_logits=True)
         reward, done = model.rew(recurrent_state, deterministic_state), model.term(recurrent_state, deterministic_state)
         legal = model.leg(recurrent_state, deterministic_state)
         #Dont use symexp here during training. Otherwise we would be training
         # the symexp outputs to match the symlog inputs.
         new_recurrent = model.get_next_recurrent_no_jit(recurrent_state, deterministic_state, action)
         new_latent_infosets = model.get_next_infoset_all_no_jit(prev_latent_infoset, obs, prev_action)
-        infoset_decoded_obs, infoset_decoded_actions = model.get_infoset_decoder_all_no_jit(new_latent_infosets)
+        infoset_decoded_obs, infoset_decoded_actions = model.get_infoset_decoder_all_no_jit(new_latent_infosets, return_logits=True)
         infoset_predicted_recurrent, infoset_predicted_deter = model.infoset_predictor(new_latent_infosets)
         preds = PredictionStepWithLegal(
                                 recurrent_state = recurrent_state,
@@ -158,7 +158,10 @@ class DreamerMA():
       _, predictions = vectorized_predict((init_recurrent, init_latent_infosets, 0), xs, ma_rssm) 
 
       #[Trajectory, Batch, num_players, obs_size]
-      reconstruction_loss = -get_normal_log_prob(predictions.decoded_obs, timestep.obs, use_symlog=True)
+      if self.wm_config.obs_loss_bce:
+        reconstruction_loss = optax.sigmoid_binary_cross_entropy(predictions.decoded_obs, timestep.obs)
+      else:
+        reconstruction_loss = -get_normal_log_prob(predictions.decoded_obs, timestep.obs, use_symlog=True)
       dec = get_loss_mean_with_mask(reconstruction_loss, timestep.valid[..., None, None], normalization_mult=2)
       l_pred += dec
       #[Trajectory, Batch, 1]
@@ -207,8 +210,10 @@ class DreamerMA():
       #is_act = 0
       l_infoset += is_act
       #Current observation loss, similar intuition as with the previous action
-      #Reduces to MSE
-      is_obs_loss = -get_normal_log_prob(predictions.infoset_decoded_obs, timestep.obs, use_symlog=True)
+      if self.wm_config.obs_loss_bce:
+        is_obs_loss = optax.sigmoid_binary_cross_entropy(predictions.infoset_decoded_obs, timestep.obs)
+      else:
+        is_obs_loss = -get_normal_log_prob(predictions.infoset_decoded_obs, timestep.obs, use_symlog=True)
       is_obs = get_loss_mean_with_mask(is_obs_loss, timestep.valid[..., None, None], normalization_mult=2)
       l_infoset += is_obs
       # The current recurrent state prediction loss. This together

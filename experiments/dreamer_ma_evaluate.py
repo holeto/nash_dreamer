@@ -159,8 +159,8 @@ def model_walk_test(model:DreamerMA,
     mistake_probs  = mistake_probs + (state_mistake_probs * reach_probability)
     if carry.terminal:
       return
-    policy_obs = symlog(carry.obs) if use_real_infoset else ma_rssm.get_infoset(carry.recurrent_state, carry.deter_state, carry.joint_latent_infoset)
-    pi = np.asarray(ma_rssm.get_policy_both(policy_obs, carry.legals, use_symlog=False))
+    policy_obs = carry.obs if use_real_infoset else ma_rssm.get_infoset(carry.recurrent_state, carry.deter_state, carry.joint_latent_infoset)
+    pi = np.asarray(ma_rssm.get_policy_both(policy_obs, carry.legals))
     if verbose:
       print(f"Checking state {carry.game_state}")
       print(f"Reach probs {reach_probability}")
@@ -239,9 +239,8 @@ def model_walk_test(model:DreamerMA,
   init_state, init_legals = model.game.initialize_structures()
   init_recurrent = ma_rssm.get_init_recurrent()
   init_chance =  model.game.is_chance(init_state)
-  per_player_init_infoset = MARSSM.vmap_over_net(ma_rssm.infoset_network, in_axes=[(None, 0, None)], out_axes=[(0)])
-  dummy_infoset = jnp.zeros((ma_rssm.infoset_size))
-  dummy_action = jnp.zeros((model.action_dimension))
+  joint_dummy_infoset = jnp.zeros((num_players, ma_rssm.infoset_size))
+  joint_dummy_action = jnp.zeros((num_players, model.action_dimension))
   if init_chance:
     chance_outcomes = model.game.depth_chance_valid_outcomes(0)
     next_states, next_terminals, next_rewards, next_legals, next_probs = unroll_chance_node(model.game, init_state, chance_outcomes)
@@ -285,7 +284,7 @@ def model_walk_test(model:DreamerMA,
                               recurrent_state= init_recurrent,
                               stoch_state=init_stoch_state,
                               deter_state=deter,
-                              joint_latent_infoset= per_player_init_infoset(dummy_infoset, init_obs, dummy_action),
+                              joint_latent_infoset=ma_rssm.get_next_infoset_all(joint_dummy_infoset, init_obs, joint_dummy_action),
                               reward=next_reward,
                               terminal=next_terminal,
                               after_chance=init_chance)
@@ -316,7 +315,7 @@ def model_walk_test(model:DreamerMA,
                               recurrent_state= init_recurrent,
                               stoch_state=init_stoch_state,
                               deter_state=deter,
-                              joint_latent_infoset=per_player_init_infoset(dummy_infoset, init_obs, dummy_action),
+                              joint_latent_infoset=ma_rssm.get_next_infoset_all(joint_dummy_infoset, init_obs, joint_dummy_action),
                               reward=jnp.array(0),
                               terminal=jnp.array(False),
                               after_chance=jnp.array(False))

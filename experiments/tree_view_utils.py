@@ -80,7 +80,7 @@ def custom_node_style(node: Node):
 #     return node.name
     #return ""
 
-def render_tree(root: Node, model: DreamerMA):
+def render_tree(root: Node, model: DreamerMA, suffix: str = ""):
     game = model.game
     game_name = game.game_name()
     empty = ""
@@ -90,7 +90,7 @@ def render_tree(root: Node, model: DreamerMA):
     tree_save_dir = os.getcwd() + "/" +  tree_save_dir
     os.makedirs(tree_save_dir, exist_ok=True)
 
-    output_filename = tree_save_dir + f"step_{model.learner_steps}.png"
+    output_filename = tree_save_dir + f"step_{model.learner_steps}{suffix}.png"
     exporter = DotExporter(root,
                            nodeattrfunc=custom_node_style,
                            #nodenamefunc= custom_node_name,

@@ -4,12 +4,53 @@ import numpy as np
 import jax.numpy as jnp
 import os
 import pickle
+import psutil
+import resource
+import time
 
 from typing import Sequence, Tuple
 
 
 
 LATEST_STEP_FILENAME = "latest.txt"
+
+
+##################################################################
+### MEMORY AND TIME USAGE DEBUGGING, taken from
+### https://stackoverflow.com/questions/938733/total-memory-used-by-python-process
+#################################################################
+def elapsed_since(start):
+    return time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
+
+
+def get_process_memory():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss
+
+def get_peak_memory():
+    # resource.getrusage returns ru_maxrss in kilobytes on Linux systems. 
+    # We multiply by 1024 to convert it to bytes to match psutil.
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+def track(func):
+    def wrapper(*args, **kwargs):
+        mem_before = get_process_memory()
+        start = time.time()
+        result = func(*args, **kwargs)
+        elapsed_time = elapsed_since(start)
+        mem_after = get_process_memory()
+        peak_memory = get_peak_memory()
+        print("{}: memory before: {:,}, after: {:,}, consumed: {:,}, peak: {:,}; exec time: {}".format(
+            func.__name__,
+            mem_before, mem_after, mem_after - mem_before, peak_memory,
+            elapsed_time))
+        return result
+    return wrapper
+
+#################################################################
+### END OF CODE FROM https://stackoverflow.com/questions/938733/total-memory-used-by-python-process
+#################################################################
 
   
 
@@ -96,6 +137,10 @@ class RNaDConfig:
 
   eta: float = 0.2 #Regularization strenght
 
+  #Clipping parameters for the counterfactual importance sampling correction.
+  cf_is_clip: float = 100.0
+
+
   #V-trace parameters
   rho_vtrace: float = 1.0 # Clipping parameter. Affects to which policy estimate V-trace converges. Inf means convergence to the estimate for the learned policy
   c_vtrace: float = 1.0 # Clipping parameter
@@ -157,6 +202,8 @@ class DreamerMAConfig():
   reward_predictor_network_details: tuple[int, int] = (256, 1)
   done_predictor_network_details: tuple[int, int] = (256, 1)
   legal_actions_network_details: tuple[int, int] = (256, 1)
+
+  obs_loss_bce: bool = True  # If True, use BCE loss for observation reconstruction; if False, use L2 (symlog targets)
 
 @chex.dataclass(frozen=True)
 class ActorCriticConfig():
@@ -319,7 +366,7 @@ def get_percentiles_with_mask(data: chex.Array, mask:chex.Array, percentile: che
   return jnp.percentile(masked_data, new_percentile)
 
 
-def get_value_from_bins(dist_logits: chex.Array, bin_range: int):
+def get_value_from_bins(dist_logits: chex.Array, bin_range: int, use_symexp=True):
   """Reads out the prediction from the predicted
   logits of the categorical distribution, by multiplying it with the bins."""
   #Implementing the summation order suggestion
@@ -334,7 +381,8 @@ def get_value_from_bins(dist_logits: chex.Array, bin_range: int):
   v_pos_part = jnp.sum(v_probs * pos_bins, axis=-1, keepdims=True)
   v_neg_part = jnp.sum(jnp.flip(v_probs * neg_bins), axis=-1, keepdims=True)
   v = v_pos_part + v_neg_part
-  v = symexp(v)
+  if use_symexp:
+    v = symexp(v)
   return v
 
 def wm_timestep_to_timestep(wm_timestep: TimeStep, wm_prediction_step: PredictionStepWithLegal, use_infoset: bool) ->ActorCriticTimeStep:
@@ -385,27 +433,41 @@ def load_model(path:str):
     return pickle.load(f)
   
   
-def parse_sequence(str_spec:str) ->list[int]:
-  """A helper utility to parse
-  a list of integers from the string specification
+def parse_sequence(str_spec: str) -> list[int]:
+    """A helper utility to parse a list of integers from the string specification
 
-  Args:
-      seeds (str): A string specification of the 
-      sequence to be used of form (num_1, num_2, num_N)
+    Args:
+        str_spec (str): A string specification of the sequence to be used 
+                        of form (num_1, num_2, num_N) or a single number "num"
 
-  Returns:
-      list[int]: A list of the integer parsed sequence.
-  """
-  assert str_spec.startswith('(') and str_spec.endswith(')'), f"Invalid string specification {str_spec}"
-  str_spec = str_spec.strip('()').split(',')
-  seq = []
-  for s in str_spec:
-    if not s.strip().isdecimal():
-      continue
-    num = int(s)
-    if num < 0:
-      num = np.random.randint(0, 2**32 - 1)
-    seq.append(num)
-  assert len(seq) > 0, f"No valid integer was found in the provided specification {str_spec}"
-  return seq
+    Returns:
+        list[int]: A list of the integer parsed sequence.
+    """
+    str_spec = str_spec.strip()
+    
+    # Relax the assertion to allow either the tuple format OR a standalone number
+    is_tuple = str_spec.startswith('(') and str_spec.endswith(')')
+    is_single_num = str_spec.replace('-', '', 1).isdecimal()
+    
+    assert is_tuple or is_single_num, f"Invalid string specification: {str_spec}"
+    
+    # strip('()') handles both "(42, 99)" and "42" flawlessly
+    str_tokens = str_spec.strip('()').split(',')
+    
+    seq = []
+    for s in str_tokens:
+        s_clean = s.strip()
+        
+        # The replace check ensures negative numbers bypass the isdecimal() 
+        # rejection so they can trigger your random seed logic below
+        if not s_clean.replace('-', '', 1).isdecimal():
+            continue
+            
+        num = int(s_clean)
+        if num < 0:
+            num = np.random.randint(0, 2**32 - 1)
+        seq.append(num)
+        
+    assert len(seq) > 0, f"No valid integer was found in the provided specification: {str_spec}"
+    return seq
   

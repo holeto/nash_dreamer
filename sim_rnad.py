@@ -139,10 +139,10 @@ def neurd_loss(
   mean_logit = jnp.sum(logits * legal, axis=-1, keepdims=True) / jnp.sum(legal, axis=-1, keepdims=True)
   
   logits_shifted = logits - mean_logit
-  threshold_ceter = jnp.zeros_like(logits_shifted)
+  threshold_center = jnp.zeros_like(logits_shifted)
   
-  neurd_loss_value = jnp.sum(legal * apply_force_with_threshold(logits_shifted, advantage, threshold, threshold_ceter), axis=-1, keepdims=True)
-  
+  neurd_loss_value = jnp.sum(legal * apply_force_with_threshold(logits_shifted, advantage, threshold, threshold_center), axis=-1, keepdims=True)
+
   return neurd_loss_value
 
 def v_trace(
@@ -166,6 +166,7 @@ def v_trace(
   # The reason we use this is to ensure this is weighted by the amount of the times we sample it
   inverted_sampling = policy_ratio(jnp.ones_like(sampling_policy), sampling_policy, action_oh, valid)
   
+
   #[Trajectory, Batch, Player]
   #This actually computes KL-divergence from the reference policy, despite being called entropy.
   #The reason for being called "entropy", is because it serves simliar purpose.
@@ -215,8 +216,11 @@ def v_trace(
     (importance_sampling, v, q_reward, entropy_reward, weighted_regularization_term, valid, inverted_sampling, action_oh) = x 
     #Use the importance sampling for both players,
     # since it is a simultaneous move game
-    rho_joint_is = jnp.prod(jnp.minimum(rho, importance_sampling), axis=-2)
+    rho_is = jnp.minimum(rho, importance_sampling)
+    rho_joint_is = jnp.prod(rho_is, axis=-2)
     c_joint_is = jnp.prod(jnp.minimum(c, importance_sampling), axis=-2)
+    rho_inv_is = jnp.minimum(rho, inverted_sampling)
+
     
     delta_v = rho_joint_is * (entropy_reward + gamma * carry.next_value - v)
     carry_delta_v = delta_v + lambda_ * c_joint_is * gamma * carry.delta_v
@@ -230,9 +234,9 @@ def v_trace(
     
     
     # We use importance sampling of the opponent.
-    opponent_sampling = jnp.flip(importance_sampling, -2)
+    opponent_sampling = jnp.flip(rho_is, -2)
     
-    q_value = per_player_v + weighted_regularization_term  + action_oh * opponent_sampling * inverted_sampling  * (q_reward + gamma * q_term)
+    q_value = per_player_v + weighted_regularization_term  + action_oh * opponent_sampling * rho_inv_is  * (q_reward + gamma * q_term)
     
     next_carry = VTraceCarry(
       next_value=v,
@@ -401,7 +405,7 @@ class SimRNaD():
       _, log_pi_prev, _ = vectorized_net_apply(prev_network, obs, timestep.legal)
       _, log_pi_prev_, _ = vectorized_net_apply(_prev_network, obs, timestep.legal)
        
-      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range)
+      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range, use_symexp=False)
       # This creates the regularization term for rewards
       regularized_term = log_pi - (alpha * log_pi_prev + (1 - alpha) * log_pi_prev_) 
       
@@ -423,6 +427,18 @@ class SimRNaD():
       #Flip to turn into counterfactual importance sampling
       importance_sampling = jnp.flip(importance_sampling, axis=-2)
       #importance_sampling = 1.0
+      #importance_sampling = 1.0)
+      #Handle the importance sampling divergence, or if 
+      # it went to NaN (inf * 0 case)
+      safe_cf_is = jnp.nan_to_num(
+        importance_sampling, 
+        nan=0.0,               # If inf multiplied by 0, the reach is functionally dead
+        posinf=self.config.cf_is_clip,  # Catch raw infinities and clamp them
+        neginf=0.0             # Reaches cannot be negative, but good hygiene
+        )
+
+      # 2. Standard clip for the finite numbers that are just too large
+      safe_cf_is = jnp.clip(safe_cf_is, 0.0, self.config.cf_is_clip)
 
       #The bin categorical loss
       v_loss = -get_bin_log_prob(v_dist_logits, bins, jax.lax.stop_gradient(v_train_target))
@@ -430,7 +446,7 @@ class SimRNaD():
       #v_loss = -get_normal_log_prob(v, jax.lax.stop_gradient(v_train_target), use_symlog=False)
       v_loss_value = get_loss_mean_with_mask(v_loss, timestep.valid[..., None])
 
-      loss_neurd = neurd_loss(logit, pi, q_value, timestep.legal, importance_sampling,
+      loss_neurd = neurd_loss(logit, pi, q_value, timestep.legal, safe_cf_is,
                                 self.config.neurd_clip, self.config.neurd_threshold)
 
       #Each player acts, so the normalization for the NeURD loss 
@@ -488,7 +504,6 @@ class SimRNaD():
     
     self.policy_switch_steps += int(update_regularization)
 
-  
   def train_model(self, model_save_dir:str, num_steps:int, print_each: int = -1, 
                   save_each: int = -1,
                   save_first: bool = False):

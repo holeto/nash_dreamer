@@ -4,53 +4,11 @@ import jax.numpy as jnp
 from functools import partial
 import numpy as np
 
-import psutil
-import resource
-import time
-import os
 
 from games.jax_game import JaxGame, GameState
 from dreamer_ma import DreamerMA
 
 
-
-##################################################################
-### MEMORY AND TIME USAGE DEBUGGING, taken from
-### https://stackoverflow.com/questions/938733/total-memory-used-by-python-process
-### accessed 09.02.2026
-#################################################################
-def elapsed_since(start):
-    return time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
-
-
-def get_process_memory():
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss
-
-def get_peak_memory():
-    # resource.getrusage returns ru_maxrss in kilobytes on Linux systems. 
-    # We multiply by 1024 to convert it to bytes to match psutil.
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-
-
-def track(func):
-    def wrapper(*args, **kwargs):
-        mem_before = get_process_memory()
-        start = time.time()
-        result = func(*args, **kwargs)
-        elapsed_time = elapsed_since(start)
-        mem_after = get_process_memory()
-        peak_memory = get_peak_memory()
-        print("{}: memory before: {:,}, after: {:,}, consumed: {:,}, peak: {:,}; exec time: {}".format(
-            func.__name__,
-            mem_before, mem_after, mem_after - mem_before, peak_memory,
-            elapsed_time))
-        return result
-    return wrapper
-
-#################################################################
-### END OF CODE FROM https://stackoverflow.com/questions/938733/total-memory-used-by-python-process
-#################################################################
 
 
 def get_next_outcomes(model: DreamerMA, stoch_state: chex.Array,

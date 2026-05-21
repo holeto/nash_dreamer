@@ -101,16 +101,16 @@ class ReplayBuffer():
     #If we supply replay ratio < 1, it is assumed
     # that we want all steps online
     if self.config.replay_ratio < 1:
-      self.online_batches = batch_size
+      self.online_trajectories = batch_size
+      self.online_trajectories_remainder = 0.0
       self.replayed_batches = 0
     else:
-      assert self.total_minibatch_size % self.config.replay_ratio == 0, f"Total size of minibatch {self.non_chance_trajectory_max}x{self.config.batch_size} is not divisible by replay ratio {self.config.replay_ratio}."
-
-      online_steps_per_batch = int(self.total_minibatch_size / self.config.replay_ratio)
-
-      assert online_steps_per_batch % self.non_chance_trajectory_max == 0, f"The amount of online steps per batch {online_steps_per_batch} needs to be divisible into trajectories of lenght {self.non_chance_trajectory_max}."
-      self.online_batches = int(online_steps_per_batch / self.non_chance_trajectory_max)
-      self.replayed_batches = batch_size - self.online_batches
+      online_steps_per_batch = self.total_minibatch_size / self.config.replay_ratio
+      online_trajectories_float = online_steps_per_batch / self.non_chance_trajectory_max
+      self.online_trajectories = int(online_trajectories_float)
+      self.online_trajectories_remainder = online_trajectories_float - self.online_trajectories
+      self.replayed_batches = batch_size - self.online_trajectories
+    self.online_trajectories_accumulator = 0.0
     
     self.smoothed_returns = [0]
     self.smoothing_rewards = np.zeros(self.config.smoothing_window)
@@ -273,14 +273,21 @@ class ReplayBuffer():
     together. The size of these batches is computed based on replay
     ratio, such that there are (batch size * trajectory len) / replay ratio
     online steps per minibatch"""
-    if self.online_batches == 0:
-      return self.sample_batch(self.replayed_batches)
-    elif self.replayed_batches == 0:
-      online_batch = self.add_batch(self.online_batches, env_sample_key)
-      return online_batch
+    self.online_trajectories_accumulator += self.online_trajectories_remainder
+    extra = 0
+    if self.online_trajectories_accumulator >= 1.0:
+      extra = 1
+      self.online_trajectories_accumulator -= 1.0
+    online_traj = self.online_trajectories + extra
+    replayed_traj = self.batch_size - online_traj
+
+    if online_traj == 0:
+      return self.sample_batch(replayed_traj)
+    elif replayed_traj == 0:
+      return self.add_batch(online_traj, env_sample_key)
     #Sample first, before putting the new online trajectories there
-    buffer_batch = self.sample_batch(self.replayed_batches)
-    online_batch = self.add_batch(self.online_batches, env_sample_key)
+    buffer_batch = self.sample_batch(replayed_traj)
+    online_batch = self.add_batch(online_traj, env_sample_key)
     #The second axis is batch size
     compound_batch = jax.tree.map(lambda x, y: jnp.concatenate([x, y], axis=1), online_batch, buffer_batch)
     return compound_batch
@@ -327,23 +334,23 @@ class ReplayBuffer():
   def getstate(self):
     return {
       "numpy_rng_state": self.np_rng.bit_generator.state,
-      "full" : self.full,
-      "smoothed_returns" : self.smoothed_returns,
-      "smoothing_idx": self.smoothing_idx,
-      "smoothing_full": self.smoothing_full,
-      "buffer_index": self.buffer_index,
-      "buffer": self.buffer,
+      #"full" : self.full,
+      #"smoothed_returns" : self.smoothed_returns,
+      #"smoothing_idx": self.smoothing_idx,
+      #"smoothing_full": self.smoothing_full,
+      #"buffer_index": self.buffer_index,
+      #"buffer": self.buffer,
     }
     
   
   def setstate(self, state):
     self.np_rng.bit_generator.state = state["numpy_rng_state"]
-    self.full = state["full"]
-    self.buffer_index = state["buffer_index"]
-    self.buffer = state["buffer"]
-    self.smoothed_returns = state["smoothed_returns"]
-    self.smoothing_full = state["smoothing_full"]
-    self.smoothing_idx = state["smoothing_idx"]
+    #self.full = state["full"]
+    #self.buffer_index = state["buffer_index"]
+    #self.buffer = state["buffer"]
+    #self.smoothed_returns = state["smoothed_returns"]
+    #self.smoothing_full = state["smoothing_full"]
+    #self.smoothing_idx = state["smoothing_idx"]
 
 
 
@@ -500,7 +507,7 @@ class WMReplayBuffer(ReplayBuffer):
   def init_constants(self):
     
     recurrent_state_size = self.wm_config.sequential_network_details[0]
-    latent_infoset_dim = self.wm_config.sequential_network_details[0]
+    latent_infoset_dim = self.wm_config.infoset_network_details[0]
 
     if recurrent_state_size < 1:
       recurrent_state_size = self.game.information_state_tensor_shape() * self.num_players
@@ -613,11 +620,12 @@ class WMReplayBuffer(ReplayBuffer):
       action_key, chance_key, deter_sample_key = jax.random.split(key, 3)
       
       obs = jnp.stack((p1_infoset, p2_infoset), axis=0)
-      tokens = encoder_network(obs)
+      enc_obs = symlog(obs) if not self.wm_config.obs_loss_bce else obs
+      tokens = encoder_network(enc_obs)
       encoded_stoch = observer_network(carry.recurrent_state, tokens)
       encoded_deter = sample_categorical(encoded_stoch, deter_sample_key, self.stoch_state_sample_threshold)
       joint_latent_infoset = carry.joint_latent_infoset
-      joint_latent_infoset = vectorized_next_infoset(infoset_network, carry.joint_latent_infoset, obs, carry.prev_action)
+      joint_latent_infoset = vectorized_next_infoset(infoset_network, carry.joint_latent_infoset, enc_obs, carry.prev_action)
       obs_for_actor = symlog(obs) if self.use_real_infoset else joint_latent_infoset
         
       pi = jax.lax.stop_gradient(vectorized_get_actor(actor_network, obs_for_actor, carry.legal_actions))

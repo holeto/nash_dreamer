@@ -14,7 +14,7 @@ from experiments.eval_utils import cartesian_product, stringify, find_closest_in
 
 
 from games.jax_game import JaxGame, GameState
-from games.model_game import DreamerModelGame, ModelGameState
+from games.model_game import DreamerModelGame, ModelGameState, InformedRealGame
 
 from dreamer_ma import DreamerMA
 from sim_rnad import SimRNaD, ACNetwork
@@ -483,7 +483,8 @@ def nash_conv(model: DreamerMA, game: JaxGame | DreamerModelGame, custom_policy:
 
 
 def head_to_head_play(game: JaxGame, model_a: MARSSM | ACNetwork, model_b: MARSSM | ACNetwork,
-                      num_games: int, key, epsilon: float = 0.0, chunk_size: int = 1024) -> chex.Array:
+                      num_games: int, key, epsilon_a: float = 0.0, epsilon_b: float = 0.0,
+                      chunk_size: int = 1024) -> chex.Array:
   """Play num_games games between two models and return per-game total rewards.
 
   Games are played in chunks of chunk_size to avoid OOM with large num_games.
@@ -558,13 +559,13 @@ def head_to_head_play(game: JaxGame, model_a: MARSSM | ACNetwork, model_b: MARSS
 
     # Actor A controls player 0
     if use_real_a:
-      pi_a = model_a.actor(symlog(obs[0]), carry.legal_actions[0])[0]
+      pi_a = model_a.get_policy(obs[0], carry.legal_actions[0])[0]
     else:
       pi_a = model_a.actor(new_latent_a, carry.legal_actions[0])[0]
 
     # Actor B controls player 1
     if use_real_b:
-      pi_b = model_b.actor(symlog(obs[1]), carry.legal_actions[1])[0]
+      pi_b = model_b.get_policy(obs[1], carry.legal_actions[1])[0]
     else:
       pi_b = model_b.actor(new_latent_b, carry.legal_actions[1])[0]
 
@@ -572,7 +573,8 @@ def head_to_head_play(game: JaxGame, model_a: MARSSM | ACNetwork, model_b: MARSS
 
     normalization = jnp.sum(carry.legal_actions, axis=-1, keepdims=True)
     uniform_pi = carry.legal_actions / (normalization + (normalization == 0))
-    pi = epsilon * uniform_pi + (1 - epsilon) * pi
+    epsilons = jnp.array([epsilon_a, epsilon_b])[:, None]
+    pi = epsilons * uniform_pi + (1 - epsilons) * pi
 
     is_chance = game.is_chance(carry.game_state)
     action_key = jax.random.split(action_key, game.num_players())

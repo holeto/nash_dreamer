@@ -51,6 +51,7 @@ def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   
   parser.add_argument("--free_bits_threshold", type=float, default=1, help="Clipping threshold for the dynamics and representation losses in free bits.")
   parser.add_argument("--uniform_mix", type=float, default=0.01, help="Amount of uniform mixed with the network returned categoricals.")
+  parser.add_argument("--obs_loss_l2", action="store_true", default=False, help="Use L2 (symlog) loss for observation reconstruction instead of BCE.")
 
   ##Network layer parameters
   parser.add_argument("--sequential_mlp_features", type=int, default=256, help="Number of hidden features in the sequential network MLP.")
@@ -91,6 +92,8 @@ def add_rnad_arguments(parser: ArgumentParser) ->ArgumentParser:
   ##Entropy schedule- network switching
   parser.add_argument("--entropy_schedule_size", default='(100, 1000)', help="Defines how many iterations should be done for each item in the sequence.")
   parser.add_argument("--entropy_schedule_repeats", default='(10, 1)', help="Defines amount of network switching sequences for each item in the sequence. Make sure last element is 1. For details see the EntropySchedule class.")
+  ##Counterfactual importance sampling parameters
+  parser.add_argument("--cf_is_clip", type=float, default=100.0, help="Clipping parameter for the counterfactual importance sampling correction.")
 
   ##V-Trace paraemters
   parser.add_argument("--rho_vtrace", type=float, default=-1.0, help="Rho clipping parameter for V-Trace. If < 0 treated as infinity (no clipping)")

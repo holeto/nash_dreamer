@@ -163,8 +163,8 @@ class JaxGame(ABC):
   def get_info(self, game_state):
     """Get information tensor about the state. For 
     multi-agent setting, this is and ordered 4-tuple state_tensor, p1_infoset_tensor,
-    p2_infoset_tensor, public_state_tensor. For single-agent,
-    this is an ordered 2-tuple state_tensor, observation_tensor"""
+    p2_infoset_tensor, public_state_tensor. Some environments may instead return observ
+    ation tensors instead of information state tensors, but the order should be the same, with the second and third tensor being the player specific ones."""
     pass
 
   #returns new_game_state, terminal, rewards, new_legals

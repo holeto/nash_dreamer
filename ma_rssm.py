@@ -30,6 +30,7 @@ class MARSSM(nnx.Module):
     # for each player and it will also work this way even for IIGs. 
     # But for now, for IIGs we just use the actual in game infosets.
     self.use_real_infoset = wm_config.use_original_infoset
+    self.obs_loss_bce = wm_config.obs_loss_bce
     self.num_actions = game.num_distinct_actions()
     self.num_players = game.num_players()
     rec_state_size = wm_config.sequential_network_details[0]
@@ -230,19 +231,24 @@ class MARSSM(nnx.Module):
     legal_actions = (legal_prob >= self.legal_threshold).astype(u8)
     return reward[0], terminal[0], legal_actions
   
-  @partial(nnx.jit, static_argnums=(2))
-  def get_decoder(self, recurrent_state: chex.Array, deter_state: chex.Array, use_symexp=True):
-    self.get_decoder_no_jit(recurrent_state, deter_state, use_symexp)
-  
-  def get_decoder_no_jit(self, recurrent_state: chex.Array, deter_state: chex.Array, use_symexp=True):
-    """Calls the decoder network and 
+  @partial(nnx.jit, static_argnums=(3))
+  def get_decoder(self, recurrent_state: chex.Array, deter_state: chex.Array, return_logits=False):
+    return self.get_decoder_no_jit(recurrent_state, deter_state, return_logits)
+
+  def get_decoder_no_jit(self, recurrent_state: chex.Array, deter_state: chex.Array, return_logits=False):
+    """Calls the decoder network and
     applies the appropriate transformation to its output.
-    Outputs either predicted real observation in single agent setting, or 
-    predicted infoset for a single player in a multi agent setting. """
+    Outputs either predicted real observation in single agent setting, or
+    predicted infoset for a single player in a multi agent setting.
+    If return_logits is True, returns the raw logits (suitable for BCE loss).
+    If return_logits is False, applies sigmoid and thresholds at 0.5 to return binary values."""
     decoder_output = MARSSM.call_net(self.dec, recurrent_state, deter_state)
-    if use_symexp:
-      decoder_output = symexp(decoder_output)
-    return decoder_output
+    if return_logits:
+      return decoder_output
+    if self.obs_loss_bce:
+      return (nnx.sigmoid(decoder_output) >= 0.5).astype(f32)
+    else:
+      return symexp(decoder_output)  # L2: output is in symlog space
   
   @nnx.jit
   def get_dynamics(self, recurrent_state:chex.Array):
@@ -255,8 +261,8 @@ class MARSSM(nnx.Module):
   def get_encoder(self, recurrent_state:chex.Array, obs: chex.Array, use_symlog=True):
     return self.get_encoder_no_jit(recurrent_state, obs, use_symlog)
   
-  def get_encoder_no_jit(self,recurrent_state:chex.Array, obs: chex.Array, use_symlog=True):
-    if use_symlog:
+  def get_encoder_no_jit(self, recurrent_state:chex.Array, obs: chex.Array, use_symlog=True):
+    if not self.obs_loss_bce:
       obs = symlog(obs)
     tokens = MARSSM.call_net(self.enc, obs)
     return MARSSM.call_net(self.observer, recurrent_state, tokens)
@@ -271,7 +277,7 @@ class MARSSM(nnx.Module):
   
   def get_next_infoset_all_no_jit(self, joint_latent_infoset: chex.Array, joint_cur_obs:chex.Array, joint_action:chex.Array, use_symlog=True):
     """Update latent infoset for both players when they observe new observation cur_obs after playing an action"""
-    if use_symlog:
+    if not self.obs_loss_bce:
       joint_cur_obs = symlog(joint_cur_obs)
     vectorized_get_infosets = MARSSM.vmap_over_net(self.infoset_network, in_axes=[(0, 0, 0)], out_axes=([0]))
     return vectorized_get_infosets(joint_latent_infoset, joint_cur_obs, joint_action)
@@ -280,22 +286,32 @@ class MARSSM(nnx.Module):
   def get_next_infoset_all(self, joint_latent_infoset: chex.Array, joint_cur_obs:chex.Array, joint_action:chex.Array, use_symlog=True):
     return self.get_next_infoset_all_no_jit(joint_latent_infoset, joint_cur_obs, joint_action, use_symlog)
 
-  def get_next_infoset_no_jit(self, latent_infoset: chex.Array, cur_obs: chex.Array, action: chex.Array, use_symlog=True):
+  def get_next_infoset_no_jit(self, latent_infoset: chex.Array, cur_obs: chex.Array, action: chex.Array, use_symlog=False):
     """Update latent infoset for a single player."""
-    if use_symlog:
+    if not self.obs_loss_bce:
       cur_obs = symlog(cur_obs)
     return MARSSM.call_net(self.infoset_network, latent_infoset, cur_obs, action)
 
-  def get_infoset_decoder_all_no_jit(self, joint_latent_infoset:chex.Array, use_symexp=False):
+  def get_infoset_decoder_all_no_jit(self, joint_latent_infoset:chex.Array, use_symexp=False, return_logits=False):
+    """Decodes all players' latent infosets into observations.
+    If return_logits is True, returns the raw logits (suitable for BCE loss).
+    If return_logits is False, applies sigmoid and thresholds at 0.5 to return binary values."""
     vectorized_infoset_decoder = MARSSM.vmap_over_net(self.infoset_decoder, in_axes=[(0, )], out_axes=[(0, 0)])
     output = vectorized_infoset_decoder(joint_latent_infoset)
-    if use_symexp:
-      output = symexp(output)
-    return output
-  
-  @partial(nnx.jit, static_argnums=2)
-  def get_infoset_decoder_all(self, joint_latent_infoset:chex.Array, use_symexp=False):
-    return self.get_infoset_decoder_all_no_jit(joint_latent_infoset, use_symexp)
+    #if use_symexp:
+      #output = symexp(output)
+    if return_logits:
+      return output
+    obs_logits, rest = output[0], output[1:]
+    if self.obs_loss_bce:
+      obs_out = (nnx.sigmoid(obs_logits) >= 0.5).astype(f32)
+    else:
+      obs_out = symexp(obs_logits)  # L2: output is in symlog space
+    return (obs_out, *rest)
+
+  @partial(nnx.jit, static_argnums=(2, 3))
+  def get_infoset_decoder_all(self, joint_latent_infoset:chex.Array, use_symexp=False, return_logits=False):
+    return self.get_infoset_decoder_all_no_jit(joint_latent_infoset, use_symexp, return_logits)
   
   
   @partial(nnx.jit, static_argnums=1)
@@ -322,21 +338,21 @@ class MARSSM(nnx.Module):
     return init_infosets
 
   
-  @partial(nnx.jit, static_argnums=3)
-  def get_policy(self, obs, legal, use_symlog=True) ->chex.Array:
-    if use_symlog:
+  @nnx.jit
+  def get_policy(self, obs, legal) ->chex.Array:
+    if not self.obs_loss_bce:
       obs = symlog(obs)
     return MARSSM.call_net(self.actor, obs, legal)
   
   
   
-  @partial(nnx.jit, static_argnums=3)
-  def get_policy_both(self, joint_obs, joint_legal, use_symlog=True) ->chex.Array:
-    return self.get_policy_both_no_jit(joint_obs, joint_legal, use_symlog)
-  
-  def get_policy_both_no_jit(self, joint_obs, joint_legal, use_symlog=True) ->chex.Array:
-    if use_symlog:
-      joint_legal = symlog(joint_obs)
+  @nnx.jit
+  def get_policy_both(self, joint_obs, joint_legal) ->chex.Array:
+    return self.get_policy_both_no_jit(joint_obs, joint_legal)
+
+  def get_policy_both_no_jit(self, joint_obs, joint_legal) ->chex.Array:
+    if not self.obs_loss_bce and self.use_real_infoset:
+      joint_obs = symlog(joint_obs)
     vectorized_actor = nnx.vmap(MARSSM.call_net, in_axes=(None, 0, 0), out_axes=0)
     return vectorized_actor(self.actor, joint_obs, joint_legal)[0]
   
@@ -398,13 +414,13 @@ class MARSSM(nnx.Module):
       #Use the infoset decoders here. We want to learn the actor/critic on
       # the latent infosets, so we just pass it through an additional layer here, 
       # to allow easy testing in the real game. However, it still requires good latent infosets.
-      decoded_obs, _ = ma_rssm.get_infoset_decoder_all_no_jit(carry.joint_latent_infoset, use_symexp=False)
+      decoded_obs, _ = ma_rssm.get_infoset_decoder_all_no_jit(carry.joint_latent_infoset, use_symexp=False, return_logits=False)
       #decoded_obs = ma_rssm.get_decoder_no_jit(carry.recurrent_state, carry.deter_state, use_symexp=False)
       
       obs = carry.joint_latent_infoset if not ma_rssm.use_real_infoset else decoded_obs
 
       #get policy 
-      pi = ma_rssm.get_policy_both_no_jit(obs, carry.legal_actions, use_symlog=False)
+      pi = ma_rssm.get_policy_both_no_jit(obs, carry.legal_actions)
       #uniform mix to the policy
       normalization = jnp.sum(carry.legal_actions, axis=-1, keepdims=True)
       uniform_pi = carry.legal_actions / (normalization + (normalization == 0))
@@ -424,7 +440,7 @@ class MARSSM(nnx.Module):
       #We need the centralized decoder here. Since we are asking 
       # about the observation AFTER playing the action. So, this is actually
       # what we need to pass to the infoset network to produce our next latent infoset.
-      next_obs = ma_rssm.get_decoder_no_jit(next_recurrent, next_deter, use_symexp=False)
+      next_obs = ma_rssm.get_decoder_no_jit(next_recurrent, next_deter, return_logits=False)
 
       next_latent_infoset = ma_rssm.get_next_infoset_all_no_jit(carry.joint_latent_infoset, next_obs, action_oh, use_symlog=False)
 

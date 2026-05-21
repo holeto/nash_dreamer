@@ -6,8 +6,6 @@ from dreamer_ma import DreamerMA, DreamerMAConfig, LATEST_STEP_FILENAME
 from sim_rnad import SimRNaD
 from games.jax_game import JaxGame
 from train_utils import *
-from experiments.eval_utils import track
-
   
 
 def train_nash_dreamer(args, game: JaxGame):
@@ -51,7 +49,8 @@ def train_nash_dreamer(args, game: JaxGame):
       legal_actions_network_details = (args.legal_predictor_hidden_features, args.legal_predictor_hidden_layers),
       infoset_network_details = (args.latent_infoset_size, args.infoset_network_hidden_features, args.infoset_network_hidden_layers),
       infoset_decoder_details = (args.infoset_decoder_hidden_features, args.infoset_decoder_hidden_layers),
-      infoset_predictor_details = (args.infoset_predictor_hidden_features, args.infoset_predictor_hidden_layers)
+      infoset_predictor_details = (args.infoset_predictor_hidden_features, args.infoset_predictor_hidden_layers),
+      obs_loss_bce = not args.obs_loss_l2
     )
     
   buffer_config = BufferConfig(buffer_size = args.buffer_size,
@@ -81,6 +80,7 @@ def train_nash_dreamer(args, game: JaxGame):
 
         eta=args.eta,
         sampling_epsilon=args.img_sampling_epsilon,
+        cf_is_clip=args.cf_is_clip,
 
         num_starts = args.num_starts,
 

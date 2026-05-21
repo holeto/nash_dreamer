@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 import os
+from matplotlib import ticker
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -9,6 +10,8 @@ parser.add_argument("--metric_store_dir", type=str, default="metrics/", help="Ba
 parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name and parameter string of the game to plot for.")
 parser.add_argument("--metric", type=str, default="nash_conv", choices=("nash_conv", "expected_util", "env_return"), help="Type of metric to plot.")
 parser.add_argument("--algos", type=str, default="NashDreamer RNaD", help="Which algorithms to plot.")
+parser.add_argument("--log_x", action="store_true", help="Plot x-axis in log scale.")
+parser.add_argument("--log_y", action="store_true", help="Plot y-axis in log scale.")
 
 
 def load_algo_metrics(metric_store_dir, algo_name, game_name, metric):
@@ -19,13 +22,14 @@ def load_algo_metrics(metric_store_dir, algo_name, game_name, metric):
     filepath = os.path.join(metric_store_dir, algo_name, game_name, f"{metric}.txt")
     if not os.path.exists(filepath):
         print(f"Metrics file not found: {filepath}")
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     seed_data = {}
     game_str = ""
     algo_str = ""
     smoothing_window = -1
     uniform_nash_conv = None
+    wm_warmup_env_step = -1
 
     current_seed = None
     current_steps = None
@@ -44,6 +48,8 @@ def load_algo_metrics(metric_store_dir, algo_name, game_name, metric):
                 smoothing_window = int(value)
             elif key == 'uniform_nash_conv':
                 uniform_nash_conv = float(value)
+            elif key == 'wm_warmup_env_step':
+                wm_warmup_env_step = float(value)
             elif key == 'seed':
                 current_seed = int(value)
                 current_steps = None
@@ -54,7 +60,7 @@ def load_algo_metrics(metric_store_dir, algo_name, game_name, metric):
                 values = np.array([float(v) for v in value.split()])
                 seed_data[current_seed] = (current_steps, values)
 
-    return seed_data, game_str, algo_str, smoothing_window, uniform_nash_conv
+    return seed_data, game_str, algo_str, smoothing_window, uniform_nash_conv, wm_warmup_env_step
 
 
 def plot_comparison(args):
@@ -69,17 +75,20 @@ def plot_comparison(args):
     game_str = ""
     smoothing_window = -1
     uniform_nash_conv = None
+    algo_warmup_steps = {}
     max_steps = 0
 
     # 1. Load Data
     for algo_name in algo_names:
-        seed_data, new_game_str, algo_str, new_smoothing_window, new_uniform_nash_conv = load_algo_metrics(
+        seed_data, new_game_str, algo_str, new_smoothing_window, new_uniform_nash_conv, wm_warmup = load_algo_metrics(
             args.metric_store_dir, algo_name, args.game_name, args.metric
         )
         algo_strs[algo_name] = algo_str
         if seed_data is None:
             continue
         results[algo_name] = seed_data
+        if wm_warmup > 0:
+            algo_warmup_steps[algo_name] = wm_warmup
         for s, (steps, metrics) in seed_data.items():
             max_steps = max(max_steps, len(steps))
         #Check if all experiments used the same game
@@ -117,7 +126,20 @@ def plot_comparison(args):
         plot_str = f"env_return_window_{smoothing_window}"
 
     # Plot Algorithm Curves
-    colors = {'NashDreamer': 'tab:red', 'RNaD': 'tab:blue', 'REINFORCE': 'tab:green'}
+    preset_colors = {
+        'NashDreamer': 'tab:blue',
+        'NashDreamerRNaD': 'tab:blue',
+        'NashDreamer without enc loss': 'tab:brown',
+        'NashDreamerREINFORCE': 'tab:orange',
+        'RNaD': 'tab:red',
+        'RNaD with replay': 'tab:green',
+    }
+    default_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    colors = {
+        algo_strs[name]: preset_colors.get(algo_strs[name], default_cycle[i % len(default_cycle)])
+        for i, name in enumerate(algo_names)
+        if algo_strs.get(name)
+    }
 
     for algo_name, seed_data in results.items():
         if not seed_data:
@@ -128,7 +150,6 @@ def plot_comparison(args):
         # We need to aggregate them.
 
         # Assumption: All seeds have the same steps.
-        # If not, we take the intersection or reference the first one.
         first_seed = list(seed_data.keys())[0]
         ref_steps = seed_data[first_seed][0]
 
@@ -148,6 +169,9 @@ def plot_comparison(args):
 
         # Calculate Statistics
         mean = np.mean(matrix, axis=0)
+
+        if args.log_x:
+            ref_steps += 1
 
         # Plot Mean Line
         color = colors.get(algo_str, 'black')
@@ -174,14 +198,27 @@ def plot_comparison(args):
         ax.axhline(y=uniform_nash_conv, xmin=0, xmax=max_steps, color='orange', linestyle='--', label="Uniform Policy", alpha=0.7)
         #ax.set_yscale('log')
 
+    # Plot world model warm-up boundary as a single vertical line
+    if algo_warmup_steps:
+        warmup_step = next(iter(algo_warmup_steps.values()))
+        ax.axvline(x=warmup_step, color='black', linestyle=':', linewidth=1.5, alpha=0.7,
+                   label="WM warm-up end")
+
     # Styling
-    ax.legend(fontsize=15)
-    ax.set_xlabel("Environment steps", fontsize=15)
-    #ax.set_xscale('log')
-    ax.set_ylabel(metric_str)
+    ax.legend(fontsize=15, loc='upper right')
+    ax.set_xlabel("Environment steps", fontsize=20)
+    if args.log_x:
+        ax.set_xscale('log')
+    if args.log_y:
+        ax.set_yscale('log')
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(bottom=min(ymin, 1e-1), top=max(ymax, 1.0))
+    ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=15))
+    ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
+    ax.set_ylabel(metric_str, fontsize=20)
     #ax.set_ylabel("Episode return", fontsize=15)
-    ax.set_title(f"Comparison {metric_str} on {args.game_name}", fontsize=20)
-    #ax.set_title(f"NashDreamer obtained returns", fontsize=20)
+    ax.tick_params(axis='both', labelsize=15)
+    ax.xaxis.get_offset_text().set_fontsize(15)
     ax.grid(True, alpha=0.3)
 
     # if args.metric == "nash_conv":

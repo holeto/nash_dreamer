@@ -11,6 +11,7 @@ def train_rnad(args, game:JaxGame):
 
         eta=args.eta,
         sampling_epsilon=args.sampling_epsilon,
+        cf_is_clip=args.cf_is_clip,
 
         # Entropy schedule parameters
         entropy_schedule_size = parse_sequence(args.entropy_schedule_size),

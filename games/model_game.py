@@ -373,4 +373,105 @@ class DreamerModelGame(JaxGame):
 #   outcomes_oh = nnx.one_hot(outcome_indices, 3, axis=-1)
 #   jax.debug.breakpoint()
 
-  
+
+@chex.dataclass(frozen=True)
+class InformedRealGameState(GameState):
+  """Real game state augmented with the latent infoset for each player,
+  computed by running observations through the infoset model."""
+  game_state: GameState
+  joint_latent_infoset: chex.Array  # [players, latent_infoset_size]
+  prev_action_oh: chex.Array        # [players, actions]
+
+
+class InformedRealGame(JaxGame):
+  """Wraps a real JaxGame and uses the world model's infoset network to
+  maintain a latent infoset for each player.  The game tree is the real
+  game tree; only the per-player information tensors are replaced with
+  latent representations produced by running observations through the
+  infoset GRU — no world-model chance nodes are introduced."""
+
+  def __init__(self, model: DreamerMA):
+    self.game = model.game
+    self.players = model.game.num_players()
+    self.actions = model.game.num_distinct_actions()
+    self.latent_infoset_size = model.latent_infoset_size
+    self._cache_infoset_net(model)
+
+  def _cache_infoset_net(self, model: DreamerMA):
+    ma_rssm_graphdef, ma_rssm_state = nnx.split(model.optimizer.model)
+
+    def _infoset_wrapper(graphdef, state, joint_latent_infoset, obs, prev_action):
+      ma_rssm = nnx.merge(graphdef, state)
+      return ma_rssm.get_next_infoset_all_no_jit(joint_latent_infoset, obs, prev_action)
+
+    self._cached_infoset_net = partial(_infoset_wrapper, ma_rssm_graphdef, ma_rssm_state)
+
+  def _compute_latent(self, joint_latent_infoset, new_game_state, prev_action_oh):
+    _, p1_obs, p2_obs, _ = self.game.get_info(new_game_state)
+    obs = jnp.stack([p1_obs, p2_obs], axis=0)
+    return self._cached_infoset_net(joint_latent_infoset, obs, prev_action_oh)
+
+  @partial(jax.jit, static_argnums=(0,))
+  def initialize_structures(self):
+    init_game_state, init_legals = self.game.initialize_structures()
+    init_latent = jnp.zeros((self.players, self.latent_infoset_size))
+    init_prev_action = jnp.zeros((self.players, self.actions))
+    # Update latent with the initial observation (no previous action yet)
+    init_latent = self._compute_latent(init_latent, init_game_state, init_prev_action)
+    state = InformedRealGameState(game_state=init_game_state,
+                                  joint_latent_infoset=init_latent,
+                                  prev_action_oh=init_prev_action)
+    return state, init_legals
+
+  @partial(jax.jit, static_argnums=(0,))
+  def get_info(self, state: InformedRealGameState):
+    state_tensor, _, _, public_tensor = self.game.get_info(state.game_state)
+    p1_latent = state.joint_latent_infoset[0]
+    p2_latent = state.joint_latent_infoset[1]
+    return state_tensor, p1_latent, p2_latent, public_tensor
+
+  @partial(jax.jit, static_argnums=(0,))
+  def apply_action(self, state: InformedRealGameState, action):
+    new_game_state, terminal, reward, new_legals = self.game.apply_action(state.game_state, action)
+    action_oh = jax.nn.one_hot(action, self.actions)
+    new_latent = self._compute_latent(state.joint_latent_infoset, new_game_state, action_oh)
+    new_state = InformedRealGameState(game_state=new_game_state,
+                                     joint_latent_infoset=new_latent,
+                                     prev_action_oh=action_oh)
+    return new_state, terminal, reward, new_legals
+
+  def is_chance(self, state: InformedRealGameState):
+    return self.game.is_chance(state.game_state)
+
+  def get_outcomes_and_probs(self, state: InformedRealGameState):
+    return self.game.get_outcomes_and_probs(state.game_state)
+
+  def game_name(self):
+    return self.game.game_name()
+
+  def params_dict(self):
+    return self.game.params_dict()
+
+  def information_type(self):
+    return self.game.information_type()
+
+  def num_players(self):
+    return self.players
+
+  def num_distinct_actions(self):
+    return self.actions
+
+  def max_trajectory_length(self):
+    return self.game.max_trajectory_length()
+
+  def state_tensor_shape(self):
+    return self.game.state_tensor_shape()
+
+  def information_state_tensor_shape(self):
+    return self.latent_infoset_size
+
+  def observation_tensor_shape(self):
+    return self.latent_infoset_size
+
+  def public_state_tensor_shape(self):
+    return self.game.public_state_tensor_shape()

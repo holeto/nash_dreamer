@@ -167,7 +167,7 @@ class DreamerActorCritic():
 
       v_target_dist_logits = vectorized_critic_apply(target_network, joint_obs)
        
-      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range)
+      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range, use_symexp=False)
       
       expanded_valid = jnp.expand_dims(timestep.valid, -1)
       #Watch out! Do not call legal_log_policy here, as
@@ -222,11 +222,12 @@ class DreamerActorCritic():
         return beta_real * loss_val, (new_range, metrics)
       
     
-    ac_timestep = wm_timestep_to_timestep(wm_timestep, wm_prediction_step, self.use_real_infoset)  
-    #starting_points = jax.tree.map(lambda x: x[-self.num_starts: ].reshape((-1, *x.shape[2:])), wm_prediction_step)
+    ac_timestep = wm_timestep_to_timestep(wm_timestep, wm_prediction_step, self.use_real_infoset)
+    #Take the starting point as the last points from the trajectory.
+    starting_points = jax.tree.map(lambda x: x[-self.num_starts: ].reshape((-1, *x.shape[2:])), wm_prediction_step)
     #Start imagination from the root and collapse the first two dimensions into num_starts * batch
-    starting_points = jax.tree.map(lambda x: jnp.repeat(x[0][None, ...], self.num_starts, axis=0).reshape((-1, *x.shape[2:])), wm_prediction_step)
-    #starting_points = jax.tree.map(lambda x: x[0].reshape((-1, *x.shape[2:])), wm_prediction_step)
+    #starting_points = jax.tree.map(lambda x: jnp.repeat(x[0][None, ...], self.num_starts, axis=0).reshape((-1, *x.shape[2:])), wm_prediction_step)
+    starting_points = jax.tree.map(lambda x: x[0].reshape((-1, *x.shape[2:])), wm_prediction_step)
     #jax.tree.map(lambda x: print(x.shape), starting_points)
     img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
       optimizer.model,

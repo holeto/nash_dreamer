@@ -119,12 +119,13 @@ class RNaDDreamer():
       v_target_dist_logits = vectorized_critic_apply(target_network, joint_obs)
       _, log_pi_prev, _ = vectorized_net_apply(prev_network, obs, timestep.legal)
       _, log_pi_prev_, _ = vectorized_net_apply(_prev_network, obs, timestep.legal)
-       
-      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range)
+
+      v_target = get_value_from_bins(v_target_dist_logits, self.config.bin_range, use_symexp=False)
       # This creates the regularization term for rewards
       regularized_term = log_pi - (alpha * log_pi_prev + (1 - alpha) * log_pi_prev_) 
       
       expanded_valid = jnp.expand_dims(timestep.valid, (-1, -2))
+
       
       v_train_target, q_value = v_trace(v_target, expanded_valid, timestep.policy, pi, regularized_term, timestep.action, timestep.reward,
                                         self.config.lambda_vtrace, self.config.c_vtrace, self.config.rho_vtrace,
@@ -139,9 +140,22 @@ class RNaDDreamer():
       
       importance_sampling = jnp.concatenate((start_reaches_is, importance_sampling[:-1]), axis=0)
       importance_sampling = jnp.cumprod(importance_sampling, axis=0)
+      
       #Flip to turn into counterfactual importance sampling
       importance_sampling = jnp.flip(importance_sampling, axis=-2)
-      #importance_sampling = 1.0
+      #importance_sampling = 1.0)
+      #Handle the importance sampling divergence, or if 
+      # it went to NaN (inf * 0 case)
+      safe_cf_is = jnp.nan_to_num(
+        importance_sampling, 
+        nan=0.0,               # If inf multiplied by 0, the reach is functionally dead
+        posinf=self.config.cf_is_clip,  # Catch raw infinities and clamp them
+        neginf=0.0             # Reaches cannot be negative, but good hygiene
+        )
+
+      # 2. Standard clip for the finite numbers that are just too large
+      safe_cf_is = jnp.clip(safe_cf_is, 0.0, self.config.cf_is_clip)
+
 
       v_loss = -get_bin_log_prob(v_dist_logits, bins, jax.lax.stop_gradient(v_train_target))
       v_loss_value = get_loss_mean_with_mask(v_loss, timestep.valid[..., None])
@@ -149,7 +163,7 @@ class RNaDDreamer():
 
       if compute_actor_loss:
         
-        loss_neurd = neurd_loss(logit, pi, q_value, timestep.legal, importance_sampling,
+        loss_neurd = neurd_loss(logit, pi, q_value, timestep.legal, safe_cf_is,
                                 self.config.neurd_clip, self.config.neurd_threshold)
 
         # The multiplication by -1 is critical here, otherwise we would
@@ -157,7 +171,6 @@ class RNaDDreamer():
         neurd_loss_value = -get_loss_mean_with_mask(loss_neurd, expanded_valid, normalization_mult=2)
       else:
         neurd_loss_value = 0
-      #jax.debug.breakpoint()
       return v_loss_value + neurd_loss_value, v_loss_value, neurd_loss_value
 
     def imagination_loss(model: MARSSM,

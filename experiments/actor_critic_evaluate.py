@@ -4,8 +4,8 @@ import json
 import os
 import time
 from experiments.policy_eval_utils import *
-from experiments.eval_utils import track
-from train_utils import load_model, parse_sequence
+from games.model_game import InformedRealGame
+from train_utils import load_model, parse_sequence, track
 
 
 parser = ArgumentParser()
@@ -14,8 +14,6 @@ parser.add_argument("--base_path", type=str, default="trained_networks", help="P
 parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name and parameter string of the game to evaluate for")
 parser.add_argument("--seeds", type=str, default='(42, )', help="Seeds of the stored models to check. Supplied as a string (seed_1, seed_2, ..., seed_n)")
 parser.add_argument("--restore_step", type=int, default=10000, help="Saved step of the model to restore. If checking entire directory, -1 is also supported for all steps")
-parser.add_argument("--algos", type=str, default="NashDreamer RNaD", help="Which algorithms to actually evaluate for.")
-
 
 parser.add_argument("--scale_factor", type=float, default=1.0, help="Scale factor to multiply all rewards by. Useful if the game implementation scaled rewards in a different way than traditional implementations."
                     "Then, this should be the inverse of the game scaling factor. For example, JaxLeduc divides all rewards by 13, so to get values appriopriately scaled as in literature, this should be set to 13.")
@@ -27,7 +25,7 @@ experiment_parsers = parser.add_subparsers(dest="experiment_type", required=True
 loaded_parser = experiment_parsers.add_parser(name="loaded", help="Evaluate best responses against particular loaded model, or all models in the directory if restore_step is -1")
 loaded_parser.add_argument("--metric", type=str, default="nash_conv", choices=("nash_conv", "expected_util", "env_return"), help="Type of metric to plot. Either NashConv, expected_utility, or smoothed environment returns during training.")
 loaded_parser.add_argument("--metric_store_dir", type=str, default="metrics/", help="Base path of the directory where to store the extracted metrics. The full path will be metric_store_dir/algo_name/game_name.")
-loaded_parser.add_argument("--algo_dirs", type=str, default="NashDreamer=nash_dreamer_rnad RNaD=rnad", help="Mapping of algorithm names to their directory names under base_path. Space-separated AlgoName=dir_name pairs. Example: 'NashDreamer=nash_dreamer_rnad RNaD=rnad_replayed'")
+loaded_parser.add_argument("--algo_dirs", type=str, default="NashDreamer=nash_dreamer_rnad RNaD=rnad NashDreamerREINFORCE=nash_dreamer_reinforce", help="Mapping of algorithm names to their directory names under base_path. Space-separated AlgoName=dir_name pairs. Example: 'NashDreamer=nash_dreamer_rnad RNaD=rnad_replayed'")
 
 nash_parser = experiment_parsers.add_parser(name="nash", help="Evaluate expected values of the model, best response values against it and also of a saved reference nash equilibrium strategy.")
 nash_parser.add_argument("--nash_strategy_path", type=str, default="experiments/goofspiel_nash.pkl", help="Path to the saved nash strategy in pickle format. Must be formatted as a tuple of behavioral strategies per tree depth and infoset map per tree_depth.")
@@ -105,7 +103,7 @@ def get_metrics_from_dir(model_dir, args):
             
             # Initialize Game
             if isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset:
-                game = DreamerModelGame(model)
+                game = InformedRealGame(model)
             else:
                 game = model.game
             first = False
@@ -117,7 +115,7 @@ def get_metrics_from_dir(model_dir, args):
             model.learner_steps = temp_model.learner_steps
             
             if isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset:
-                game = DreamerModelGame(model)
+                game = InformedRealGame(model)
 
         # Calculate Metric
         if args.metric == "nash_conv":
@@ -147,9 +145,9 @@ def get_metrics_from_dir(model_dir, args):
         batch_size = model.wm_config.batch_size if isinstance(model, DreamerMA) else model.batch_size
         ratio = 1 if model.buffer_config.replay_ratio <= 0 else model.buffer_config.replay_ratio
         env_steps = sorted_steps * ((batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio)
-        return env_steps, metrics[sort_indices], game
+        return env_steps, metrics[sort_indices], game, _wm_warmup_env_step(model)
     else:
-        return [], [], game
+        return [], [], game, -1
 
 
 def _config_to_dict(model):
@@ -169,6 +167,33 @@ def _config_to_dict(model):
     return {}
 
 
+def _wm_warmup_env_step(model):
+    """Return the env step at which the world model warm-up period ends.
+    Returns -1 if the model has no world model or warm-up period is 0."""
+    if not isinstance(model, DreamerMA):
+        return -1
+    warm_up_grad_steps = model.ac_config.wm_warm_up_period
+    if warm_up_grad_steps <= 0:
+        return -1
+    batch_size = model.wm_config.batch_size
+    ratio = 1 if model.buffer_config.replay_ratio <= 0 else model.buffer_config.replay_ratio
+    env_step_per_grad_step = (batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio
+    return float(warm_up_grad_steps * env_step_per_grad_step)
+
+
+def _wm_warmup_env_step_from_dir(model_dir):
+    """Load the first checkpoint from model_dir and return its warmup env step."""
+    if not model_dir.startswith("/"):
+        model_dir = os.path.join(os.getcwd(), model_dir)
+    if not os.path.exists(model_dir):
+        return -1
+    files = sorted(f for f in os.listdir(model_dir) if f.endswith(".pkl"))
+    if not files:
+        return -1
+    model = load_model(os.path.join(model_dir, files[0]))
+    return _wm_warmup_env_step(model)
+
+
 def extract_config_from_dir(model_dir, restore_step):
     """Load one checkpoint from model_dir and return its config as a dict."""
     if not model_dir.startswith("/"):
@@ -185,7 +210,7 @@ def extract_config_from_dir(model_dir, restore_step):
     return None
 
 
-def save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, plotting_names, args):
+def save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, plotting_names, algo_warmup_steps, args):
     """Save extracted metrics to text files under metric_store_dir/algo_name/game_name/metric.txt.
     Also saves a config.json in the same directory when config data is available."""
     for algo_name, seed_data in results.items():
@@ -198,6 +223,7 @@ def save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_co
             f.write(f"game_str: {game_str}\n")
             f.write(f"metric: {args.metric}\n")
             f.write(f"smoothing_window: {smoothing_window}\n")
+            f.write(f"wm_warmup_env_step: {algo_warmup_steps.get(algo_name, -1)}\n")
             if uniform_nash_conv is not None:
                 f.write(f"uniform_nash_conv: {uniform_nash_conv}\n")
             for seed, (steps, metrics) in seed_data.items():
@@ -231,11 +257,12 @@ def plot_comparison(args):
         for algo_name, dir_name in algo_dir_map.items()
     }
     names = {v: k for k, v in algo_dir_map.items()}
-    algos = {algo_dir_map[k]: v for k, v in algos.items() if k in args.algos}
+    algos = {algo_dir_map[k]: v for k, v in algos.items()}
     print(f"Evaluating for {algos}")
 
     results = {v: {} for k, v in algo_dir_map.items()}
     algo_configs = {}
+    algo_warmup_steps = {}
     game_str = ""
     game = None
     smoothing_window = -1
@@ -249,22 +276,25 @@ def plot_comparison(args):
         if args.metric == 'env_return':
             steps, metrics, game_str, smoothing_window = parse_env_returns(directory)
             game = None
+            wm_warmup_env_step = _wm_warmup_env_step_from_dir(directory)
         else:
-            steps, metrics, game = get_metrics_from_dir(d, args)
+            steps, metrics, game, wm_warmup_env_step = get_metrics_from_dir(d, args)
             game_str = str(game)
             smoothing_window = -1
-        return steps, metrics, game, game_str, smoothing_window
+        return steps, metrics, game, game_str, smoothing_window, wm_warmup_env_step
 
 
 
     # 1. Collect Data
     for algo_name, dir_paths in algos.items():
         for s, d in zip(seeds,dir_paths):
-            steps, metrics, game, new_game_str, new_smoothing_window = metrics_wrapper(d, args)
+            steps, metrics, game, new_game_str, new_smoothing_window, wm_warmup = metrics_wrapper(d, args)
             if algo_name not in algo_configs and args.metric != 'env_return':
                 config = extract_config_from_dir(d, args.restore_step)
                 if config:
                     algo_configs[algo_name] = config
+            if algo_name not in algo_warmup_steps and wm_warmup >= 0:
+                algo_warmup_steps[algo_name] = wm_warmup
             if steps is not None and len(steps) > 0:
                 max_steps = max(max_steps, len(steps))
                 results[algo_name][s] = (steps, metrics)
@@ -294,7 +324,7 @@ def plot_comparison(args):
         uniform_nash_conv = args.scale_factor * nash_conv(None, game, uniform_policy)
 
     # 3. Save metrics
-    save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, names, args)
+    save_metrics(results, game_str, smoothing_window, uniform_nash_conv, algo_configs, names, algo_warmup_steps, args)
 
 def test_nash(args, saved_nash_path: str):
   model_path = args.model_dir
@@ -319,7 +349,7 @@ def test_nash(args, saved_nash_path: str):
   # model = RNaDDreamerJoint(dreamer_model, RNaDConfig())
   assert isinstance(model, DreamerMA), f"The loaded model should be an instance of DreamerMA. Instead got {model.__class__}"
   
-  game = DreamerModelGame(model) if (isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset) else  model.game
+  game = InformedRealGame(model) if (isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset) else model.game
   p1_nash_val, p2_nash_val, nash_infoset_map, nash_behaviorals = load_model(nash_path)
   print(f"Loaded nash policies of game with game value {p1_nash_val} (from player 1 perspective)")
   model_map, model_behaviorals = extract_model_policy(model, game)

@@ -16,26 +16,28 @@ class GoofspielGameState(GameState):
 
 
 class JaxGoofspiel(JaxGame):
-  def __init__(self, cards, points_order="descending", turns=-1, reward_type: str = "clip") -> None:
+  def __init__(self, cards, points_order="descending", turns=-1, reward_type: str = "clip", observation_only: bool = False) -> None:
     self.cards = cards
     self.max_turns = turns
     if turns <= 0:
       self.max_turns = cards
-    self.points_order = points_order 
+    self.points_order = points_order
     self.reward_type = 0 if reward_type == "clip" else 1
+    self.observation_only = observation_only
     
   
   def game_name(self):
     return "goofspiel"
-  
+
   def params_dict(self):
-    #Possible to also add other relevant information
-    # for now just the cards will do to organize into subdirs
-    return {"num_cards" : self.cards}
-  
+    d = {"num_cards": self.cards}
+    if self.observation_only:
+      d["observation_only"] = "obs"
+    return d
+
   def information_type(self):
     return InformationType.IIG
-  
+
   def num_players(self):
     return 2
 
@@ -45,16 +47,17 @@ class JaxGoofspiel(JaxGame):
   def information_state_tensor_shape(self):
     return self.max_turns * self.cards + self.max_turns * 2 + self.max_turns * self.cards * 2 + 2
   
-  # TODO: Change this
   def observation_tensor_shape(self):
+    if self.observation_only:
+      return self.cards + 4
     return self.information_state_tensor_shape()
-  
+
   def public_state_tensor_shape(self):
     return self.max_turns * self.cards + self.max_turns * 2 + self.max_turns * self.cards
-  
+
   def num_distinct_actions(self):
     return self.cards
-  
+
   def max_trajectory_length(self):
     return self.max_turns
   
@@ -97,8 +100,19 @@ class JaxGoofspiel(JaxGame):
     p2_infoset_tensor = jnp.concatenate([1 - p1_player, public_state_tensor, jnp.ravel(game_state.played_cards[1])], axis=0)
     
     state_tensor = jnp.concatenate([public_state_tensor, jnp.ravel(game_state.played_cards)], axis=0)
-    
-    
+
+    if self.observation_only:
+      oh_current_point = jax.nn.one_hot(game_state.point_cards[game_state.turn] - 1, self.cards)
+      prev_idx = jnp.maximum(game_state.turn - 1, 0)
+      prev_points = game_state.p1_points[prev_idx]
+      p2_won = jnp.where(prev_points < 0, 1, 0) - (prev_points == 0)
+      prev_winner = jax.nn.one_hot(p2_won, 2)
+      p1_player = jax.nn.one_hot(0, 2)
+      public_observation = jnp.concatenate([oh_current_point, prev_winner], axis=0)
+      p1_observation = jnp.concatenate([p1_player, public_observation], axis=0)
+      p2_observation = jnp.concatenate([1 - p1_player, public_observation], axis=0)
+      return state_tensor, p1_observation, p2_observation, public_observation
+
     return state_tensor, p1_infoset_tensor, p2_infoset_tensor, public_state_tensor
   
   @functools.partial(jax.jit, static_argnums=(0,))
