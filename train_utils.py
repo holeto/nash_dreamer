@@ -91,7 +91,9 @@ class ActorCriticTimeStep():
 @chex.dataclass(frozen=True)
 class TimeStep():
   
-  obs: chex.Array = () # [..., Player, infoset_dim] for multi agent or [..., obs_dim] for single_agent
+  obs: chex.Array = () # [..., Player, obs_dim]
+  negative_samples: chex.Array = () # [..., Player, num_negatives, num_classes * num_categories]
+
   legal: chex.Array = () # [..., Player, A] for multi agent or [..., A] for single_agent
   
   action: chex.Array = () # [..., Player, A] for multi agent or [..., A] for single agent
@@ -115,6 +117,8 @@ class BufferConfig:
   return_log_frequency: int = 10
   smoothing_window: int = 50
   log_returns: bool = False
+  
+  number_of_negatives: int = 5 #Number of negative samples to use for the contrastive loss. If 0, no contrastive loss is used.
 
 @chex.dataclass(frozen=True)
 class RNaDConfig:
@@ -183,6 +187,14 @@ class DreamerMAConfig():
   beta_dynamics: float = 1
   beta_representation: float = 0.1
   beta_infoset: float = 1.0
+  beta_contrastive: float = 1.0
+
+  #Distributional loss parameters
+  jsd: bool =False #Whether to use JSD or KL for the prior/posterior distance
+  max_divergence_scaling: bool = False #Whether to scale the prior/posterior distance
+  
+  #Contrastive loss parameters
+  contrastive_temperature: float = 0.1 #Temperature parameter for the contrastive loss.
 
   free_bits_clip_threshold: float = 1 #Threshold for loss clip in free bits.
   uniform_mix: float = 0.01 # Amount of uniform mixture added to the 

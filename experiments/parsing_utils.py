@@ -48,10 +48,19 @@ def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   parser.add_argument("--beta_dynamics", type=float, default=1, help="The beta coefficient for dynamics (pushing prior prediction towards posterior) loss")
   parser.add_argument("--beta_representation", type=float, default=0.1, help="The beta coefficient for representation (pushing posterior representation toward prior) loss")
   parser.add_argument("--beta_infoset", type=float, default=1.0, help="The beta coefficient for latent infoset learning loss")
-  
+  parser.add_argument("--beta_contrastive", type=float, default=1.0, help="The beta coefficient for contrastive loss")
+
   parser.add_argument("--free_bits_threshold", type=float, default=1, help="Clipping threshold for the dynamics and representation losses in free bits.")
   parser.add_argument("--uniform_mix", type=float, default=0.01, help="Amount of uniform mixed with the network returned categoricals.")
   parser.add_argument("--obs_loss_l2", action="store_true", default=False, help="Use L2 (symlog) loss for observation reconstruction instead of BCE.")
+
+  ##Distribution loss parameters
+  parser.add_argument("--jsd", action="store_true", default=False, help="Use Jensen-Shannon divergence for the dynamics and representation losses instead of KL-divergence.")
+  parser.add_argument("--max_divergence_scaling", action="store_true", default=False, help="Scale the contrastive and reconstruction losses by the maximum value of the prior/posterior loss.")
+
+  ##Contrastive loss parameters
+  parser.add_argument("--number_of_negatives", type=int, default=5, help="Number of negative samples to use for the contrastive loss. Always >= 1.")
+  parser.add_argument("--contrastive_temperature", type=float, default=0.1, help="Temperature parameter for the contrastive loss.")
 
   ##Network layer parameters
   parser.add_argument("--sequential_mlp_features", type=int, default=256, help="Number of hidden features in the sequential network MLP.")

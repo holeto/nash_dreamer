@@ -79,12 +79,28 @@ class DreamerMA():
     #Also cache the sampling for the buffer
     self.buffer.cache_sampling(ma_rssm.seq, ma_rssm.enc, ma_rssm.observer, ma_rssm.infoset_network, ma_rssm.actor)
     self.grad_norms = {k: 0 for k in self.network_keys}
-    self.metrics = {'dec': 0, 'con': 0, 'leg': 0,  'rew': 0, 'dyn': 0, 'rep': 0,'is_act_dec': 0, 'is_obs_dec': 0, 'is_rec_pred': 0, 'is_deter_pred': 0}
+    self.metrics = {'dec': 0, 'con': 0, 'leg': 0,  'rew': 0, 'dyn': 0, 'rep': 0,'is_act_dec': 0, 'is_obs_dec': 0, 'is_rec_pred': 0, 'is_deter_pred': 0, 'contrastive': 0}
     if self.use_real_infoset:
       assert self.game.information_state_tensor_shape() == self.game.observation_tensor_shape(), "Specification of use_real_infoset is only sound when the environment provides infoset in place of observation!"
       print(f"Using original game infosets of shape {self.infoset_size}")
     else:
       print(f"Using latent infosets of shape {self.infoset_size}")
+    if not self.wm_config.max_divergence_scaling:
+      print(f"Scaling turned off")
+      self.maximum_divergence = 1
+    #For each of the scaling losses, 
+    # we multiply by 2, since the metric is computed in both directions
+    elif self.wm_config.jsd:
+      #Maximum value of the metric used for prior/posterior
+      # distance. For JSD it is log(n), where n is the number
+      # of outcomes
+      self.maximum_divergence = 2 * jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes)
+    else:
+      #For KL, we get additional dependence on the uniform mixture constant
+      # this is an upper bound, that assumes the posterior does not get the uniform mixture
+      self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
+
+    print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
     
   
   def generate_key(self):
@@ -188,13 +204,30 @@ class DreamerMA():
       posterior = nnx.softmax(predictions.repr_state, axis=-1)
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch]
-      dynamics_loss = kl_divergence(jax.lax.stop_gradient(posterior), prior)
+      metric = jsd if self.wm_config.jsd else kl_divergence
+      dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
       l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
       #[Trajectory, Batch]
-      repr_loss = kl_divergence(posterior, jax.lax.stop_gradient(prior))
+      repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
-      
-      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics, self.wm_config.beta_representation, *(self.wm_config.beta_infoset, ) * 4]
+
+      #Contrastive loss between the posterior (positive) and the negative
+      # sample logits stored alongside the timestep.
+      #[Trajectory, Batch, num_negatives, encoded_classes * encoded_categories]
+      positive_probs = nnx.softmax(predictions.repr_state, axis=-1)
+      negative_probs = nnx.softmax(timestep.negative_samples, axis=-1)
+      contrastive_loss = jnp.sum(jnp.maximum(0, self.maximum_divergence - jsd(positive_probs[..., None,:, :], negative_probs)), axis=-1)
+      #exp_dist = jnp.exp(-jnp.sum((timestep.negative_samples - positive_logits[..., None, :]) ** 2, axis=-1) / self.wm_config.contrastive_temperature)
+      #[Trajectory, Batch]
+      #contrastive_distance = jnp.sum(exp_dist, axis=-1)
+      #contrastive_loss = -jnp.log(1.0 / (1.0 + contrastive_distance))
+      con_neg = get_loss_mean_with_mask(contrastive_loss, timestep.valid)
+      #jax.debug.breakpoint()
+
+      #Multiply the prediction losses with
+      # the maximum information metric value, to prevent collapse
+      # being the optimal solution.
+      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics / self.maximum_divergence, self.wm_config.beta_representation / self.maximum_divergence, *(self.wm_config.beta_infoset, ) * 4, self.wm_config.beta_contrastive]
       l_infoset = 0
       #Update the latent infosets
       #The action loss predicts the previous action. Which also means we do not
@@ -230,7 +263,7 @@ class DreamerMA():
       l_infoset += is_deter
 
       
-      losses = [dec, con, leg, rew, l_dyn, l_rep, is_act, is_obs, is_rec, is_deter]
+      losses = [dec, con, leg, rew, l_dyn, l_rep, is_act, is_obs, is_rec, is_deter, con_neg]
 
       wm_keys = self.metrics.keys()
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}

@@ -125,6 +125,13 @@ def kl_divergence(orig: chex.Array, other: chex.Array) ->chex.Array:
   div_term = jnp.log(orig) - jnp.log(other)
   divergence_unmasked = jnp.sum(orig * div_term, axis=(-1, -2))
   return divergence_unmasked
+
+def jsd(orig: chex.Array, other: chex.Array) -> chex.Array:
+  """Computes the Jensen-Shannon divergence between two distributions. Expects both orig and other to already be softmaxed
+  into probability distributions. Returning jsd is summed over the last two dimensions
+  [categoricals, classes]."""
+  mixture = (orig + other) * 0.5
+  return (kl_divergence(orig, mixture) + kl_divergence(other, mixture))  * 0.5
    
 
 

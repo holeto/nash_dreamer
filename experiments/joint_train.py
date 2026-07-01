@@ -30,6 +30,7 @@ def train_nash_dreamer(args, game: JaxGame):
       beta_dynamics = args.beta_dynamics,
       beta_representation = args.beta_representation,
       beta_infoset = args.beta_infoset,
+      beta_contrastive = args.beta_contrastive,
       
       free_bits_clip_threshold = args.free_bits_threshold,
       uniform_mix = args.uniform_mix,
@@ -37,6 +38,12 @@ def train_nash_dreamer(args, game: JaxGame):
       encoded_classes = args.encoded_classes,
       encoded_categories = args.encoded_categories,
       bin_range = args.wm_bin_range,
+
+      jsd=args.jsd,
+      max_divergence_scaling = args.max_divergence_scaling,
+      
+      #Contrastive loss parameters
+      contrastive_temperature = args.contrastive_temperature,
 
       # Ordered as (hidden_layer_features, num_hidden_layers)
       sequential_network_details = (args.recurrent_state_size, args.sequential_mlp_features, args.sequential_mlp_layers),
@@ -58,7 +65,8 @@ def train_nash_dreamer(args, game: JaxGame):
                                 replay_ratio = args.replay_ratio,
                                 smoothing_window = args.smoothing_window,
                                 log_returns = args.log_returns,
-                                return_log_frequency = args.return_log_frequency)
+                                return_log_frequency = args.return_log_frequency,      
+                                number_of_negatives = args.number_of_negatives,)
   opt_config = OptimizerConfig(lr = args.lr,
                                       agc = args.agc,
                                       eps = args.opt_eps,
