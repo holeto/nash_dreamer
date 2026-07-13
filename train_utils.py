@@ -58,6 +58,7 @@ def track(func):
 class PredictionStepWithLegal():
   recurrent_state: chex.Array
   repr_state: chex.Array
+  tokens: chex.Array  # encoder output, shape (..., encoder_tokens_features)
   deter_state: chex.Array
   decoded_obs: chex.Array
   reward_dist_logit: chex.Array
@@ -92,7 +93,7 @@ class ActorCriticTimeStep():
 class TimeStep():
   
   obs: chex.Array = () # [..., Player, obs_dim]
-  negative_samples: chex.Array = () # [..., Player, num_negatives, num_classes * num_categories]
+  negative_obs: chex.Array = () # [..., num_negatives, num_players * obs_features]
 
   legal: chex.Array = () # [..., Player, A] for multi agent or [..., A] for single_agent
   

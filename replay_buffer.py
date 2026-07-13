@@ -22,7 +22,7 @@ class BufferTimeStep():
   """Same structure as TimeStep, only
   is intended to be used on CPU, hence the arrays are numpy"""
   obs: np.ndarray
-  negative_samples: np.ndarray
+  negative_obs: np.ndarray
   action: np.ndarray
   legal: np.ndarray
   policy: np.ndarray
@@ -33,7 +33,7 @@ class BufferTimeStep():
   def __getitem__(self, indices):
     return BufferTimeStep(
       obs = self.obs[indices],
-      negative_samples = self.negative_samples[indices],
+      negative_obs = self.negative_obs[indices],
       action = self.action[indices],
       legal = self.legal[indices],
       policy = self.policy[indices],
@@ -44,7 +44,7 @@ class BufferTimeStep():
 
   def __setitem__(self, indices, value):
     self.obs[indices] = value.obs
-    self.negative_samples[indices] = value.negative_samples 
+    self.negative_obs[indices] = value.negative_obs 
     self.action[indices] = value.action
     self.legal[indices] = value.legal
     self.policy[indices] = value.policy
@@ -149,7 +149,7 @@ class ReplayBuffer():
     else:  
       self.example_timestep = TimeStep(
                                       obs= ex_obs,
-                                      negative_samples = jnp.zeros((self.num_negatives, self.wm_config.encoded_classes, self.wm_config.encoded_categories), dtype=float),
+                                      negative_obs = jnp.zeros((self.num_negatives, int(np.prod(ex_obs.shape))), dtype=float),
                                       action=action,
                                       legal=legal,
                                       policy = policy,
@@ -175,10 +175,10 @@ class ReplayBuffer():
                                     reward=reward,
                                     valid=valid)
     else:
-      negative_samples = np.zeros((self.config.buffer_size, self.non_chance_trajectory_max, self.num_negatives, self.wm_config.encoded_classes, self.wm_config.encoded_categories), dtype=float)
+      negative_obs = np.zeros((self.config.buffer_size, self.non_chance_trajectory_max, self.num_negatives, int(np.prod(self.example_timestep.obs.shape))), dtype=float)
       self.buffer = BufferTimeStep(
         obs = obs,
-        negative_samples = negative_samples,
+        negative_obs = negative_obs,
         action = action,
         legal = legal,
         policy = policy,
@@ -204,7 +204,7 @@ class ReplayBuffer():
     else:
       buffer_timestep = BufferTimeStep(
                                       obs= np.asarray(env_timestep.obs),
-                                      negative_samples = np.asarray(env_timestep.negative_samples),
+                                      negative_obs = np.asarray(env_timestep.negative_obs),
                                       action= np.asarray(env_timestep.action),
                                       legal= np.asarray(env_timestep.legal),
                                       policy= np.asarray(env_timestep.policy),
@@ -228,7 +228,7 @@ class ReplayBuffer():
     else:
       env_timestep = TimeStep(
                                       obs= jnp.asarray(buffer_timestep.obs),
-                                      negative_samples = jnp.asarray(buffer_timestep.negative_samples),
+                                      negative_obs = jnp.asarray(buffer_timestep.negative_obs),
                                       action= jnp.asarray(buffer_timestep.action),
                                       legal= jnp.asarray(buffer_timestep.legal),
                                       policy= jnp.asarray(buffer_timestep.policy),
@@ -606,9 +606,8 @@ class WMReplayBuffer(ReplayBuffer):
       joint_latent_infoset: chex.Array
       prev_action: chex.Array
       prev_is_chance: chex.Array #Was the previous row a chance node?
-      pending_negative_samples: chex.Array #Negatives computed by the previous
-                                            # row's chance resolution, encoded with
-                                            # the recurrent_state this row now has
+      pending_negative_obs: chex.Array #Flattened negative observations from the
+                                            # previous row's chance resolution
 
     init_carry = SampleTrajectoryCarry(
       game_state = game_state,
@@ -620,7 +619,7 @@ class WMReplayBuffer(ReplayBuffer):
       joint_latent_infoset= init_infoset,
       prev_action = dummy_action,
       prev_is_chance = jnp.array(False),
-      pending_negative_samples = jnp.zeros((self.num_negatives, self.wm_config.encoded_classes, self.wm_config.encoded_categories))
+      pending_negative_obs = jnp.zeros((self.num_negatives, int(np.prod(self.example_timestep.obs.shape))))
     )
     
     
@@ -638,17 +637,13 @@ class WMReplayBuffer(ReplayBuffer):
     #per player vmap
     vectorized_get_actor = nnx.vmap(get_actor_policy, in_axes=(None, 0, 0), out_axes=0)
 
-    def encode_negative_outcome(encoder_graphdef: nnx.GraphDef, encoder_state: nnx.State, observer_graphdef: nnx.GraphDef, observer_state: nnx.State, recurrent_state, game_state, outcome):
-      encoder_network = nnx.merge(encoder_graphdef, encoder_state)
-      observer_network = nnx.merge(observer_graphdef, observer_state)
+    def encode_negative_outcome(game_state, outcome):
       neg_state, _, _, _ = self.game.apply_action(game_state, outcome)
       _, neg_p1_infoset, neg_p2_infoset, _ = self.game.get_info(neg_state)
       neg_obs = jnp.stack((neg_p1_infoset, neg_p2_infoset), axis=0)
-      neg_enc_obs = symlog(neg_obs) if not self.wm_config.obs_loss_bce else neg_obs
-      neg_tokens = encoder_network(neg_enc_obs)
-      return observer_network(recurrent_state, neg_tokens)
-    #vmap over the negative outcomes, broadcasting the networks/recurrent_state/game_state
-    vectorized_encode_negative = jax.vmap(encode_negative_outcome, in_axes=(None, None, None, None, None, None, 0), out_axes=0)
+      return neg_obs.reshape(-1)
+    #vmap over the negative outcomes; game_state is broadcast as a closure
+    vectorized_encode_negative = jax.vmap(encode_negative_outcome, in_axes=(None, 0), out_axes=0)
 
     @nnx.scan(in_axes=(nnx.Carry, None, None, None, None,None, 0), out_axes=(nnx.Carry, 0))
     def _sample_trajectory(carry: SampleTrajectoryCarry, recurrent_network: SequenceModel, encoder_network:Encoder, observer_network: ObservedPredictor,
@@ -660,8 +655,8 @@ class WMReplayBuffer(ReplayBuffer):
       
       obs = jnp.stack((p1_infoset, p2_infoset), axis=0)
       enc_obs = symlog(obs) if not self.wm_config.obs_loss_bce else obs
-      tokens = encoder_network(enc_obs)
-      encoded_stoch = observer_network(carry.recurrent_state, tokens)
+      tokens = encoder_network(carry.recurrent_state, enc_obs)
+      encoded_stoch = observer_network(tokens)
       encoded_deter = sample_categorical(encoded_stoch, deter_sample_key, self.stoch_state_sample_threshold)
       joint_latent_infoset = carry.joint_latent_infoset
       joint_latent_infoset = vectorized_next_infoset(infoset_network, carry.joint_latent_infoset, enc_obs, carry.prev_action)
@@ -678,11 +673,11 @@ class WMReplayBuffer(ReplayBuffer):
       #Does not depend on the cond's outcome, so it can be computed here already
       # and used to encode negatives meant for the *next* row.
       next_recur = recurrent_network(carry.recurrent_state, encoded_deter, action_oh)
-      def apply_action(encoder_graphdef: nnx.GraphDef, encoder_state: nnx.State, observer_graphdef: nnx.GraphDef, observer_state: nnx.State):
+      def apply_action():
         next_state, terminal, reward, legal = self.game.apply_action(carry.game_state, action)
-        next_pending_negative_samples = jnp.tile(encoded_stoch[None, ...], (self.num_negatives, 1, 1))
-        return next_state, terminal, reward, legal, next_pending_negative_samples
-      def sample_chance(encoder_graphdef: nnx.GraphDef, encoder_state: nnx.State, observer_graphdef: nnx.GraphDef, observer_state: nnx.State):
+        next_pending_negative_obs = jnp.zeros((self.num_negatives, obs.size), dtype=obs.dtype)
+        return next_state, terminal, reward, legal, next_pending_negative_obs
+      def sample_chance():
         outcomes, probs = self.game.get_outcomes_and_probs(carry.game_state)
         # Do not forget for deterministic games to put nonzero probs
         # to sample something for shape consistency
@@ -704,31 +699,24 @@ class WMReplayBuffer(ReplayBuffer):
 
         outcome, terminal, reward, chosen_legals = self.game.apply_action(carry.game_state, chosen_outcome)
 
-        #These outcomes describe alternate realizations of the observation that
-        # becomes visible at the *next* row, so they must be encoded with
-        # next_recur (the recurrent state the next row will condition on), not
-        # carry.recurrent_state.
-        next_pending_negative_samples = vectorized_encode_negative(encoder_graphdef, encoder_state, observer_graphdef, observer_state, next_recur, carry.game_state, neg_outcomes)
+        next_pending_negative_obs = vectorized_encode_negative(carry.game_state, neg_outcomes)
 
-        return outcome, terminal, reward, chosen_legals, next_pending_negative_samples
-      
-      encoder_graphdef, encoder_state = nnx.split(encoder_network)
-      observer_graphdef, observer_state = nnx.split(observer_network)
-      next_game_state, next_terminal, next_rewards, next_legal, next_pending_negative_samples = jax.lax.cond(is_chance, 
-                                    sample_chance, apply_action, encoder_graphdef, encoder_state, observer_graphdef, observer_state)
+        return outcome, terminal, reward, chosen_legals, next_pending_negative_obs
+
+      next_game_state, next_terminal, next_rewards, next_legal, next_pending_negative_obs = jax.lax.cond(is_chance,
+                                    sample_chance, apply_action)
 
       #This row's own negatives: real ones handed down from a chance resolution
       # at the previous row (now correctly conditioned on this row's
-      # recurrent_state), or trivial repeats of this row's own encoded_stoch if
-      # nothing preceded it.
-      own_negative_samples = jnp.where(
+      # or trivial repeats of this row's own obs if nothing preceded it.
+      own_negative_obs = jnp.where(
           carry.prev_is_chance,
-          carry.pending_negative_samples,
-          jnp.tile(encoded_stoch[None, ...], (self.num_negatives, 1, 1)))
+          carry.pending_negative_obs,
+          jnp.zeros((self.num_negatives, obs.size), dtype=obs.dtype))
 
       timestep = TimeStep(
         obs = obs,
-        negative_samples = own_negative_samples,
+        negative_obs = own_negative_obs,
         legal = carry.legal_actions.astype(u8),
         action = action_oh.astype(u8),
         policy = pi,
@@ -750,7 +738,7 @@ class WMReplayBuffer(ReplayBuffer):
         joint_latent_infoset = joint_latent_infoset,
         prev_action = action_oh,
         prev_is_chance = is_chance,
-        pending_negative_samples = next_pending_negative_samples
+        pending_negative_obs = next_pending_negative_obs
 
       )
         

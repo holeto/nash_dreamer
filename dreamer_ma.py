@@ -131,7 +131,9 @@ class DreamerMA():
         # at the current timestep. At first step, 
         # there was no previous action so we zero it out
         prev_action = jnp.where(timestep == 0, 0, prev_action)
-        stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
+        enc_obs = symlog(obs) if not model.obs_loss_bce else obs
+        tokens = model.enc(recurrent_state, enc_obs)
+        stochastic_state = model.observer(tokens)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         deterministic_state = sample_categorical(stochastic_state, cur_key)
         prior_stochastic_state = model.get_dynamics_no_jit(recurrent_state)
@@ -148,6 +150,7 @@ class DreamerMA():
         preds = PredictionStepWithLegal(
                                 recurrent_state = recurrent_state,
                                 repr_state = stochastic_state,
+                                tokens = tokens,
                                 deter_state = deterministic_state,
                                 decoded_obs = decoded_obs,
                                 reward_dist_logit = reward,
@@ -211,18 +214,26 @@ class DreamerMA():
       repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
-      #Contrastive loss between the posterior (positive) and the negative
-      # sample logits stored alongside the timestep.
-      #[Trajectory, Batch, num_negatives, encoded_classes * encoded_categories]
-      positive_probs = nnx.softmax(predictions.repr_state, axis=-1)
-      negative_probs = nnx.softmax(timestep.negative_samples, axis=-1)
-      contrastive_loss = jnp.sum(jnp.maximum(0, self.maximum_divergence - jsd(positive_probs[..., None,:, :], negative_probs)), axis=-1)
-      #exp_dist = jnp.exp(-jnp.sum((timestep.negative_samples - positive_logits[..., None, :]) ** 2, axis=-1) / self.wm_config.contrastive_temperature)
+      #Contrastive loss, we want to
+      # maximize the mutual information between the recurrent state/observation
+      # embedding and the observation.
+      #[Trajectory, Batch, obs_size * num_players]
+      flattened_obs = timestep.obs.reshape((*timestep.obs.shape[:-2], -1))
+      #[Trajectory, Batch, 1 + neg_samples, obs_size * num_players]
+      obs_with_negatives = jnp.concatenate((flattened_obs[..., None, :], timestep.negative_obs), axis=-2)
+      #Embeddings first, observations second
+      over_sample_similarity = nnx.vmap(MARSSM.call_net, in_axes=(None, None, 0), out_axes=0)
+      #Inner vmap over batch, outer over trajectory
+      vectorized_similarity = nnx.vmap(nnx.vmap(over_sample_similarity, in_axes=(None, 0, 0), out_axes=0), in_axes=(None, 0, 0), out_axes=0)
+      #[Trajectory, Batch, 1 + neg_samples]
+      similarity = vectorized_similarity(ma_rssm.embed_critic, predictions.tokens, obs_with_negatives)
+      #We want to maximize the similarity to the
       #[Trajectory, Batch]
-      #contrastive_distance = jnp.sum(exp_dist, axis=-1)
-      #contrastive_loss = -jnp.log(1.0 / (1.0 + contrastive_distance))
+      log_probs = jax.nn.log_softmax(similarity / self.wm_config.contrastive_temperature, axis=-1)
+      #Make sure to multiply by -1 to maximize the probability of the positive sample
+      contrastive_loss = -log_probs[..., 0]
+
       con_neg = get_loss_mean_with_mask(contrastive_loss, timestep.valid)
-      #jax.debug.breakpoint()
 
       #Multiply the prediction losses with
       # the maximum information metric value, to prevent collapse
@@ -269,6 +280,8 @@ class DreamerMA():
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}
       
       compound_loss = sum(l * m for l, m in zip(losses, mults))
+      
+      #jax.debug.breakpoint(num_frames=2)
 
       return compound_loss, (predictions, metrics)
   
@@ -281,6 +294,7 @@ class DreamerMA():
     
     loss, (pred_step, metrics) = func_data
     optimizer.update(grad)
+    #jax.debug.breakpoint(num_frames=2)
     
     return loss, pred_step, metrics, grad_norms
     

@@ -222,35 +222,53 @@ class Encoder(nnx.Module):
   return a latent feature vector that, along with the current
   recurrent state, will be used to produce current stochastic state logits.
   Centralized: accepts joint observations of shape (..., num_players, observation_features)."""
-  def __init__(self, num_players, observation_features, tokens_features, hidden_features, num_layers, rngs: nnx.Rngs) -> None:
+  def __init__(self, num_players, observation_features, recurrent_state_size, tokens_features, hidden_features, num_layers, rngs: nnx.Rngs) -> None:
 
     self.tokens_features = tokens_features
-    self.init_layer = LinNormRelu(num_players * observation_features, hidden_features, rngs)
+    self.init_layer = LinNormRelu(recurrent_state_size + num_players * observation_features, hidden_features, rngs)
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
     self.last_layer = nnx.Linear(hidden_features, tokens_features, rngs=rngs)
 
-  def __call__(self, observations: chex.Array):
+  def __call__(self, recurrent_state: chex.Array, observations: chex.Array):
     flat_obs = jnp.reshape(observations, (*observations.shape[:-2], -1))
-    x = self.init_layer(flat_obs)
+    x = jnp.concatenate([recurrent_state, flat_obs], axis=-1)
+    x = self.init_layer(x)
     x = self.core_mlp(x)
     tokens = self.last_layer(x)
     return tokens
+
+class EmbeddingCritic(nnx.Module):
+  """Receive an observation/recurrent state encoding
+  and observation, and return the cosine similarity between a learnable
+  linear projection of the observation vector and the embedding."""
+  def __init__(self, num_tokens: int, observation_features: int, num_players:int,  rngs: nnx.Rngs):
+    self.W = nnx.Linear(num_players * observation_features, num_tokens, rngs=rngs)
+  def __call__(self, embedding: chex.Array, joint_observation: chex.Array):
+    #Project the observation into the embedding space
+    # We want the embedding to contain positively
+    # correlated information with the observation
+    projected_obs = self.W(joint_observation)
+    #Compute the cosine similarity between the embedding and the projected observation
+    #obs_norm = jnp.linalg.norm(projected_obs, ord=2, axis=-1, keepdims=True)
+    #embedding_norm = jnp.linalg.norm(embedding, ord=2, axis=-1, keepdims=True)
+    #projected_obs = projected_obs / (obs_norm + 1e-8)
+    #embedding = embedding / (embedding_norm + 1e-8)
+    return jnp.sum(projected_obs * embedding, axis=-1)
   
 class ObservedPredictor(nnx.Module):
   """Receive a current recurrent state and observation
   latent tokens produced by some encoder and return current stochastic
   state logits."""
 
-  def __init__(self, recurrent_state_size, token_features, encoded_classes, encoded_categories, hidden_features, num_layers, rngs:nnx.Rngs) ->None:
+  def __init__(self, token_features, encoded_classes, encoded_categories, hidden_features, num_layers, rngs:nnx.Rngs) ->None:
     self.encoded_classes = encoded_classes
     self.encoded_categories = encoded_categories
-    self.init_layer = LinNormRelu(recurrent_state_size + token_features, hidden_features, rngs)
+    self.init_layer = LinNormRelu(token_features, hidden_features, rngs)
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
     self.last_layer = nnx.Linear(hidden_features, (encoded_classes * encoded_categories), rngs=rngs)
 
-  def __call__(self, recurrent_state: chex.Array, obs_tokens: chex.Array):
-    x = jnp.concatenate([recurrent_state, obs_tokens], axis=-1)
-    x = self.init_layer(x)
+  def __call__(self, obs_tokens: chex.Array):
+    x = self.init_layer(obs_tokens)
     x = self.core_mlp(x)
     stoch_logits = self.last_layer(x)
     stoch_logits = jnp.reshape(stoch_logits, (*stoch_logits.shape[:-1], self.encoded_classes, self.encoded_categories))

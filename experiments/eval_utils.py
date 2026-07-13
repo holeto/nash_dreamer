@@ -54,6 +54,7 @@ def get_closest_next_ma(model: DreamerMA, recurrent_state, next_deter, next_info
   decoded_obs = ma_rssm.get_decoder(recurrent_state, next_deter)
   next_dists = np.sum((decoded_obs[None, ...] - next_infosets) ** 2, axis=(-1, -2))
   next_closest  = np.argmin(next_dists)
+  #jax.debug.breakpoint()
   return next_closest
 
 

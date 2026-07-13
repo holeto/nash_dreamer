@@ -103,6 +103,7 @@ class MARSSM(nnx.Module):
                                  rngs=rngs)
     self.enc = Encoder(self.num_players,
                                 self.observation_size,
+                                rec_state_size,
                                 enc_tokens,
                                 wm_config.encoder_network_details[1],
                                 wm_config.encoder_network_details[2],
@@ -117,15 +118,14 @@ class MARSSM(nnx.Module):
                           wm_config.decoder_network_details[0],
                           wm_config.decoder_network_details[1],
                           rngs)
-    self.observer = ObservedPredictor(rec_state_size,
-                                      enc_tokens,
+    self.observer = ObservedPredictor(enc_tokens,
                                       wm_config.encoded_classes,
                                       wm_config.encoded_categories,
                                       wm_config.observer_network_details[0],
                                       wm_config.observer_network_details[1],
                                       rngs)
     
-    self.network_names = ['dyn', 'seq', 'enc','leg', 'observer', 'dec', 'rew', 'term', 'infoset_network', 'infoset_decoder', 'infoset_predictor', 'actor', 'critic']
+    self.network_names = ['dyn', 'seq', 'enc','leg', 'observer', 'dec', 'rew', 'term', 'infoset_network', 'infoset_decoder', 'infoset_predictor', 'embed_critic', 'actor', 'critic']
 
     self.infoset_network = InfosetModel(self.observation_size,
                                       self.num_actions,
@@ -147,6 +147,9 @@ class MARSSM(nnx.Module):
                                             wm_config.infoset_predictor_details[0],
                                             wm_config.infoset_predictor_details[1],
                                             rngs)
+    self.embed_critic = EmbeddingCritic(wm_config.encoder_network_details[0],
+                                         self.observation_size, self.num_players, 
+                                         rngs)
 
     self.actor = ActorNetwork(self.infoset_size,
                               self.num_actions,
@@ -264,8 +267,8 @@ class MARSSM(nnx.Module):
   def get_encoder_no_jit(self, recurrent_state:chex.Array, obs: chex.Array, use_symlog=True):
     if not self.obs_loss_bce:
       obs = symlog(obs)
-    tokens = MARSSM.call_net(self.enc, obs)
-    return MARSSM.call_net(self.observer, recurrent_state, tokens)
+    tokens = MARSSM.call_net(self.enc, recurrent_state, obs)
+    return MARSSM.call_net(self.observer, tokens)
 
   
   @nnx.jit

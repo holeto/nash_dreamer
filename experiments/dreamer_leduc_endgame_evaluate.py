@@ -132,6 +132,50 @@ def get_topk_outcomes(model, stoch_state, recurrent_state, obs, probability_eps,
             result_probs.append([p_list[i] for i in top_idx])
     return result_deters, result_probs
 
+def decode_outcomes(model, stoch_state, recurrent_state, probabilty_eps):
+    deter_states = (stoch_state >= probabilty_eps).astype(int)
+    class_indices, category_indices = np.nonzero(deter_states)
+    per_class_valids = []
+    num_classes = stoch_state.shape[0]
+    for i in range(num_classes):
+        single_class_indices = category_indices[class_indices == i]
+        per_class_valids.append(single_class_indices)
+
+    combinations = cartesian_product(*per_class_valids)
+    probs = []
+    deters = []
+    public_cards = []
+    private_cards = []
+    public_card_mask = np.arange(7)[None, ...]
+    card_mask = np.arange(6)[None, ...]
+    for comb in combinations:
+        prob = np.prod(stoch_state[np.arange(num_classes), comb])
+        sampled_deter = jax.nn.one_hot(comb, stoch_state.shape[-1])
+        decoded_obs = model.optimizer.model.get_decoder(recurrent_state, sampled_deter)
+        #Public card from the view of each player
+        public_card_oh = decoded_obs[:, 8:15] >= 0.4
+        public_card = np.sum(public_card_oh * public_card_mask, axis=-1)
+        if np.sum(public_card_oh) != 2:
+            print(f"Decoded public card is not unique: {decoded_obs[:, 8:15]}")
+            print(f"Decoded public card one-hot: {public_card_oh}")
+            print(f"Decoded public card: {public_card}")
+            print(f"Outcome prob: {prob}")
+            jax.debug.breakpoint()
+        #Private cardsfrom the view of each players
+        private_card_oh = decoded_obs[:, 2:8] >= 0.4
+        if np.sum(private_card_oh) != 2:
+            print(f"Decoded private card is not unique: {decoded_obs[:, 2:8]}")
+            print(f"Decoded private card one-hot: {private_card_oh}")
+            print(f"Decoded private card: {private_card}")
+            print(f"Outcome prob: {prob}")
+            jax.debug.breakpoint()
+        private_card = np.sum(private_card_oh * card_mask, axis=-1)
+        probs.append(prob)
+        deters.append(sampled_deter)
+        public_cards.append(public_card)
+        private_cards.append(private_card)
+    jax.debug.breakpoint()
+
 
 def _filter_stoch(logits, probability_eps: float):
     """Softmax → zero out below eps → renormalize."""
@@ -169,6 +213,7 @@ def _replay_private_cards(model: DreamerMA, p1_card: int, p2_card: int,
     obs = get_both_obs(state)
     stoch = _filter_stoch(ma_rssm.get_encoder(recurrent, obs), probability_eps)
     dyn_stoch = _filter_stoch(ma_rssm.get_dynamics(recurrent), probability_eps)
+    decode_outcomes(model, dyn_stoch, recurrent, probability_eps)
     deters_list, probs_list = get_next_outcomes(model, stoch, recurrent, obs[None], probability_eps)
     deters_list, probs_list = deters_list[0], probs_list[0]
     if len(deters_list) == 0:
@@ -267,6 +312,7 @@ def _replay_to_public_chance(model: DreamerMA, p1_card: int, p2_card: int,
         state = next_state
         recurrent = next_recurrent
         last_action_oh = action_oh
+    
 
     assert game.is_chance(state), (
         "After replaying round1_actions the game state should be a chance node "
