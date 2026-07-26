@@ -200,8 +200,25 @@ def add_nash_dreamer_arguments(parser: ArgumentParser):
 
   return parser
 
-def add_sim_rnad_arguments(parser: ArgumentParser):
-  """Prepares a parser, that will run RNaD only without the world model."""
+def add_mmd_arguments(parser: ArgumentParser) ->ArgumentParser:
+  """Add all the MMD required arguments to the given parser."""
+
+  ##MMD/PPO parameters
+  parser.add_argument("--num_epochs", type=int, default=4, help="Number of inner gradient steps taken on each collected on-policy batch. One collected batch is one mirror descent iteration. With 1, the policy ratio stays exactly 1 and both the clipping and the proximal KL become no-ops, which reduces the update to REINFORCE.")
+  parser.add_argument("--clip_epsilon", type=float, default=0.2, help="The PPO clipping parameter for the policy ratio.")
+  parser.add_argument("--kl_coeff", type=float, default=0.1, help="Weight of the explicit mirror descent proximal term KL(pi || pi_old).")
+  parser.add_argument("--magnet_coeff", type=float, default=0.05, help="Weight of the magnet term KL(pi || uniform), which with a uniform magnet is an entropy exploration bonus. THE PARAMETER TO SWEEP PER GAME, it sets the temperature of the quantal response equilibrium MMD converges to. Games with a pure equilibrium want it small (goofspiel_3 reaches nash_conv 0.0000 anywhere in [0, 0.2] but 0.9534 at 1.0), games with a mixed equilibrium want it large (RPS reaches 0.105 at 1.0 but 1.784 at 0.2). It lives on the scale of the normalized advantage, so do not carry the much smaller RNaD eta over to it.")
+  parser.add_argument("--adv_norm_eps", type=float, default=1e-8, help="Numerical stability term for the PPO advantage normalization.")
+
+  ##TD(lambda)/GAE parameters
+  parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for the TD(lambda)/GAE estimate.")
+  parser.add_argument("--td_lambda", type=float, default=0.95, help="Lambda parameter for the TD(lambda)/GAE estimate.")
+
+  return parser
+
+def add_standalone_training_arguments(parser: ArgumentParser) -> ArgumentParser:
+  """Adds the arguments shared by all the standalone actor-critic
+  learners, that are trained on the real environment without the world model."""
   parser.add_argument("--seeds", type=str, default='(42, )', help="RNG seeds for the whole algorithm. Supplied as (seed_1, seed_2, ..., seed_n) If -1 a random seed is generated.")
   parser.add_argument("--num_steps", type=int, default=1001, help="Number of training steps")
   parser.add_argument("--save_each", type=int, default=100, help="Save model every N steps")
@@ -213,7 +230,7 @@ def add_sim_rnad_arguments(parser: ArgumentParser):
 
   parser.add_argument(f"--batch_size", type=int, default=64, help="Minibatch size for the learning.")
   parser.add_argument("--report_gradnorms", action="store_true", help="Whether to report gradient norms as well as losses.")
-  
+
   parser.add_argument("--sampling_epsilon", type=float, default=0.0, help="Defines mix of uniform policy to the network learned policy during environment trajectory sampling.")
 
   parser.add_argument(f"--bin_range", type=int, default=20, help="Number of the exponentially spaced bins for the value categorical distribution prediction")
@@ -229,20 +246,35 @@ def add_sim_rnad_arguments(parser: ArgumentParser):
   parser = add_optimizer_arguments(parser)
   #Replay buffer arguments
   parser = add_replay_arguments(parser)
+  return parser
+
+def add_sim_rnad_arguments(parser: ArgumentParser):
+  """Prepares a parser, that will run RNaD only without the world model."""
+  parser = add_standalone_training_arguments(parser)
   #RNaD specific arguments
   parser = add_rnad_arguments(parser)
   return parser
 
+def add_sim_mmd_arguments(parser: ArgumentParser):
+  """Prepares a parser, that will run MMD only without the world model."""
+  parser = add_standalone_training_arguments(parser)
+  #MMD specific arguments
+  parser = add_mmd_arguments(parser)
+  return parser
+
 def prepare_experiment_parser():
-  """Prepares a general experiment parser, that 
-  can handle run for both NashDreamer and standalone RNaD"""
+  """Prepares a general experiment parser, that
+  can handle run for NashDreamer, standalone RNaD and standalone MMD"""
   parser = ArgumentParser()
-  
-  subparsers = parser.add_subparsers(dest='experiment_type', required=True, help="Which experiment type to run nash_dreamer for full training with world model, or rnad to run RNaD only with real environment")
+
+  subparsers = parser.add_subparsers(dest='experiment_type', required=True, help="Which experiment type to run nash_dreamer for full training with world model, rnad to run RNaD only with real environment, or mmd to run MMD only with real environment")
   nd_parser = subparsers.add_parser('nash_dreamer', help="Run the full NashDreamer training loop, training both the actor-critic and the world model.")
   add_nash_dreamer_arguments(nd_parser)
 
   rnad_parser = subparsers.add_parser('rnad', help='Run RNaD training on the real environment without the world model')
   add_sim_rnad_arguments(rnad_parser)
+
+  mmd_parser = subparsers.add_parser('mmd', help='Run MMD training on the real environment without the world model')
+  add_sim_mmd_arguments(mmd_parser)
 
   return parser

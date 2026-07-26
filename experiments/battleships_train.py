@@ -1,6 +1,7 @@
 from games.jax_battleships import JaxBattleships
 from experiments.joint_train import train_nash_dreamer
 from experiments.rnad_train import train_rnad
+from experiments.mmd_train import train_mmd
 from experiments.parsing_utils import prepare_experiment_parser
 
 
@@ -17,6 +18,8 @@ def main():
   game = JaxBattleships(board_shape=(args.board_height, args.board_width), ship_sizes=ship_sizes)
   if args.experiment_type == 'nash_dreamer':
     train_nash_dreamer(args, game)
+  elif args.experiment_type == 'mmd':
+    train_mmd(args, game)
   else:
     train_rnad(args, game)
 

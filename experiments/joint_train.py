@@ -4,6 +4,7 @@ from shutil import rmtree
 
 from dreamer_ma import DreamerMA, DreamerMAConfig, LATEST_STEP_FILENAME
 from sim_rnad import SimRNaD
+from sim_mmd import SimMMD
 from games.jax_game import JaxGame
 from train_utils import *
   
@@ -160,13 +161,13 @@ def train_nash_dreamer(args, game: JaxGame):
     train_loop(args, seed, model)
 
 @track
-def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
+def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD):
   """Run the actual training loop
 
   Args:
       args (_type_): Argument specification. Detailed description of arguments can be found in parsing_utils.py
       seed (int): The PRNG seed for this training instance
-      template_model (DreamerMA|SimRNaD): A precreated template model, that has the same 
+      template_model (DreamerMA|SimRNaD|SimMMD): A precreated template model, that has the same
       configuration as all the models during the training, except seed. This is used
       to just update the network/optimizer state and seed of the template model
       instead of initializing new one each time, to avoid unnnecessary retracing.
@@ -175,7 +176,12 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
   game = template_model.game
   model_root_dir = args.model_save_dir
   if not model_root_dir:
-      model_root_dir = f"nash_dreamer_{args.train_mode}" if isinstance(template_model, DreamerMA) else f"rnad"
+      if isinstance(template_model, DreamerMA):
+        model_root_dir = f"nash_dreamer_{args.train_mode}"
+      elif isinstance(template_model, SimMMD):
+        model_root_dir = f"mmd"
+      else:
+        model_root_dir = f"rnad"
   
   model_save_dir = f"/trained_networks/{model_root_dir}/{game.to_compact_str()}/seed_{seed}/"
   model_save_dir = os.getcwd() + model_save_dir
@@ -199,13 +205,15 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD):
   if saved_model_file:
     print(f"Loading model from path {saved_model_file}")
     model = load_model(saved_model_file)
-    assert isinstance(model, DreamerMA| SimRNaD), f"The loaded model should be a DreamerMA or SimRNaD instance, not {model.__class__}"
+    assert isinstance(model, DreamerMA| SimRNaD| SimMMD), f"The loaded model should be a DreamerMA, SimRNaD or SimMMD instance, not {model.__class__}"
     assert seed == model.init_seed, f"The given seed {seed} and the initial seed of the stored model {model.init_seed} do not match."
 
   else:
     print("Creating clean model")
     if isinstance(template_model, DreamerMA):
       model = DreamerMA(template_model.wm_config, template_model.buffer_config, template_model.ac_config, template_model.opt_config, game, seed)
+    elif isinstance(template_model, SimMMD):
+      model = SimMMD(template_model.game, template_model.config, template_model.opt_config, template_model.buffer_config, seed, template_model.batch_size)
     else:
       model = SimRNaD(template_model.game, template_model.config, template_model.opt_config, template_model.buffer_config, seed, template_model.batch_size)
   #Will still retrace the nnx networks.

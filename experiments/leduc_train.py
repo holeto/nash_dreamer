@@ -2,6 +2,7 @@
 from games.jax_leduc import JaxLeduc, JaxLeducRound1
 from experiments.joint_train import train_nash_dreamer
 from experiments.rnad_train import train_rnad
+from experiments.mmd_train import train_mmd
 from experiments.parsing_utils import prepare_experiment_parser
 
 
@@ -18,6 +19,8 @@ def main():
   game = JaxLeducRound1(max_raises=args.max_raises) if args.one_round else JaxLeduc()
   if args.experiment_type == 'nash_dreamer':
     train_nash_dreamer(args, game)
+  elif args.experiment_type == 'mmd':
+    train_mmd(args, game)
   else:
     train_rnad(args, game)
     

@@ -1,6 +1,7 @@
 from games.jax_goofspiel import JaxGoofspiel, JaxRandomGoofspiel
 from experiments.joint_train import train_nash_dreamer
 from experiments.rnad_train import train_rnad
+from experiments.mmd_train import train_mmd
 from experiments.parsing_utils import prepare_experiment_parser
 
 
@@ -19,6 +20,8 @@ def main():
     game = JaxGoofspiel(cards=args.num_cards, observation_only=args.observation_only)
   if args.experiment_type == 'nash_dreamer':
     train_nash_dreamer(args, game)
+  elif args.experiment_type == 'mmd':
+    train_mmd(args, game)
   else:
     train_rnad(args, game)
     
