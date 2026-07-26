@@ -172,6 +172,53 @@ class RNaDConfig:
 
 
 @chex.dataclass(frozen=True)
+class MMDConfig:
+  """Configuration of the standalone Magnetic Mirror Descent learner.
+  The magnet is fixed at the uniform policy, which makes the magnet term
+  KL(pi || magnet) an entropy exploration bonus (up to a per state constant).
+  The resulting algorithm is effectively PPO with an entropy bonus and
+  the mirror descent proximal term KL(pi || pi_old) made explicit."""
+
+  report_gradnorms: bool = False #Whether to report gradient norms.
+
+  #MMD/PPO parameters
+  num_epochs: int = 4 #Number of inner gradient steps taken on each collected on-policy batch
+  clip_epsilon: float = 0.2 #The PPO clipping parameter for the policy ratio
+  kl_coeff: float = 0.1 #Weight of the explicit proximal term KL(pi || pi_old)
+  #Weight of the magnet term KL(pi || uniform), i.e. the entropy exploration bonus.
+  # THIS IS THE PARAMETER TO SWEEP PER GAME. It sets the temperature of the quantal
+  # response equilibrium that MMD converges to, and the best value depends on how
+  # mixed the equilibrium of the game is.
+  #  - A pure equilibrium wants a small magnet, because a uniform magnet pulls away
+  #    from every pure strategy. Measured on goofspiel_3 over 1000 steps, nash_conv
+  #    reached 0.0000 for every value in [0, 0.2], but 0.9534 at 1.0.
+  #  - A mixed equilibrium wants a large magnet, because the regularization is what
+  #    stops the policy gradient from cycling away from it. Measured on RPS, whose
+  #    equilibrium is uniform, over 200 steps, nash_conv reached 0.105 at 1.0 but
+  #    1.784 at 0.2 and 1.998 at 0.
+  # Note that this lives on the scale of the advantage, which the standard PPO
+  # normalization rescales to unit standard deviation. That keeps the policy gradient
+  # force at O(1) even at an equilibrium, where the whole advantage is sampling noise,
+  # while the magnet force is exactly zero at the uniform policy and only grows as the
+  # policy drifts away from it. So do not carry the much smaller RNaD eta over here,
+  # RNaD does not normalize its advantages.
+  magnet_coeff: float = 0.05
+  adv_norm_eps: float = 1e-8 #Numerical stability term for the advantage normalization
+
+  #TD(lambda)/GAE parameters
+  gamma: float = 1.0 # Discount factor
+  td_lambda: float = 0.95 #Same as TD-learning lambda
+
+  #Ordered as hidden layer size, num hidden layers
+  actor_network_details: Tuple[int, int] = (256, 1)
+  critic_network_details: Tuple[int, int] = (256, 1)
+
+  bin_range: int = 20 #Number of the exponentially spaced bins for the value categorical distribution prediction
+
+  target_network_update: float = 1e-3
+
+
+@chex.dataclass(frozen=True)
 class DreamerMAConfig():
   batch_size: int
 

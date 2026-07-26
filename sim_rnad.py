@@ -267,9 +267,11 @@ def v_trace(
 
 class ACNetwork(nnx.Module):
   """A container module, that wraps the actor
-  and critic into a single class, to have one optimizer for both."""
+  and critic into a single class, to have one optimizer for both.
+  Shared by all the standalone actor-critic learners, it only reads the
+  network detail and bin range fields that all their configs carry."""
 
-  def __init__(self, game: JaxGame, config: RNaDConfig, rngs: nnx.Rngs):
+  def __init__(self, game: JaxGame, config: RNaDConfig | MMDConfig, rngs: nnx.Rngs):
 
     self.actor = ActorNetwork(game.information_state_tensor_shape(), game.num_distinct_actions(),
                               config.actor_network_details[0], config.actor_network_details[1], rngs=rngs)
