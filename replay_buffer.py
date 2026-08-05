@@ -17,6 +17,110 @@ from train_utils import TimeStep, ActorCriticTimeStep,BufferConfig, DreamerMACon
 u8 = jnp.uint8
 nu8 = np.uint8
 
+
+def filter_chance_rewards(reward: chex.Array, is_chance: chex.Array, non_chance_max: int) -> chex.Array:
+  """Attribute the per-step rewards of a raw trajectory to its non-chance steps.
+
+  The actor-critic timestep stores the reward for *acting* at a step, so each
+  non-chance step must carry its own reward plus the rewards of every chance step
+  that follows it, up to the next non-chance step. Expressed as a segment sum this
+  is independent of how chance and play nodes interleave.
+
+  It replaces a `jnp.nonzero(~jnp.roll(is_chance, 1), ...)` mask. `jnp.roll(x, 1)`
+  shifts right, so that mask actually tested whether the *previous* step was a
+  chance node, which credited every step with the reward of the step after it. In
+  games where chance and play strictly alternate (`JaxRandomGoofspiel`) every play
+  was therefore credited with a chance node's reward -- always zero -- and the whole
+  trajectory return was silently destroyed.
+
+  Note WMReplayBuffer does NOT use this: its TimeStep stores the reward for
+  *arriving* at a step, which stays aligned with obs under the plain non-chance
+  mask, and train_utils.wm_timestep_to_timestep does the conversion shift.
+  """
+  #Index of the most recent non-chance step. Leading chance steps get -1 and are
+  # dropped, they precede every decision in the filtered trajectory.
+  segment = jnp.cumsum((~is_chance).astype(jnp.int32), axis=0) - 1
+  contribution = jnp.where(segment >= 0, reward, jnp.zeros_like(reward))
+  return jax.ops.segment_sum(contribution, jnp.maximum(segment, 0),
+                             num_segments=non_chance_max).astype(reward.dtype)
+
+
+#Games already checked in this process, keyed by to_compact_str(). The check is a
+# property of the game, not of the learner, so once per game per process is enough.
+_CHECKED_GAMES = set()
+
+
+def check_reward_alignment(game: JaxGame, num_trajectories: int = 4, seed: int = 0):
+  """Verify that filtering the chance nodes out of a trajectory preserves its return.
+
+  Runs a handful of uniform-policy rollouts and compares the sum of the raw per-step
+  rewards against the sum after `filter_chance_rewards`. A mismatch means reward is
+  being silently discarded, which shows up as a zero advantage and a learner that
+  never moves off its initial policy -- not as an error. It has happened: every
+  `JaxRandomGoofspiel` run lost 100% of its reward this way.
+
+  The two ways a game can still fail this after the filter itself is correct are the
+  two length declarations, both of which this catches:
+    * `max_trajectory_length()` too small -- the game never reaches terminal inside
+      the scan, so the terminal reward is never collected.
+    * `max_trajectory_lenght_no_chance()` too small -- trailing segments fall off the
+      end of the segment sum.
+  """
+  key = jax.random.key(seed)
+  actions = game.num_distinct_actions()
+  trajectory_max = game.max_trajectory_length()
+  non_chance_max = game.max_trajectory_lenght_no_chance()
+  for _ in range(num_trajectories):
+    key, traj_key = jax.random.split(key)
+    game_state, legal_actions = game.initialize_structures()
+    rewards, chance_flags = [], []
+    valid, reached_terminal = True, False
+    for _ in range(trajectory_max):
+      traj_key, action_key, chance_key = jax.random.split(traj_key, 3)
+      is_chance = bool(game.is_chance(game_state))
+      if is_chance:
+        outcomes, probs = game.get_outcomes_and_probs(game_state)
+        chosen = jax.random.choice(chance_key, outcomes, p=probs)
+        game_state, terminal, reward, legal_actions = game.apply_action(game_state, chosen)
+      else:
+        normalization = jnp.sum(legal_actions, axis=-1, keepdims=True)
+        pi = legal_actions / (normalization + (normalization == 0))
+        action_keys = jax.random.split(action_key, game.num_players())
+        action = jnp.stack([jax.random.choice(action_keys[p], actions, p=pi[p])
+                            for p in range(game.num_players())])
+        game_state, terminal, reward, legal_actions = game.apply_action(game_state, action)
+      #Post-terminal steps are absorbing and must not contribute, exactly as the
+      # rollout masks them out with the example timestep.
+      rewards.append(float(reward) if valid else 0.0)
+      chance_flags.append(is_chance)
+      if valid and bool(terminal):
+        reached_terminal = True
+      valid = valid and not bool(terminal)
+
+    raw = jnp.asarray(rewards)
+    filtered = filter_chance_rewards(raw, jnp.asarray(chance_flags), non_chance_max)
+    if not reached_terminal:
+      raise AssertionError(
+          f"Game {game.to_compact_str()} did not reach a terminal state within "
+          f"max_trajectory_length()={trajectory_max}. The terminal reward is never "
+          f"collected, so every trajectory return is wrong.")
+    if not bool(jnp.allclose(jnp.sum(filtered), jnp.sum(raw))):
+      raise AssertionError(
+          f"Game {game.to_compact_str()} loses reward when its chance nodes are filtered "
+          f"out: raw return {float(jnp.sum(raw)):+.6f} but {float(jnp.sum(filtered)):+.6f} "
+          f"after filtering. Check max_trajectory_length()={trajectory_max} and "
+          f"max_trajectory_lenght_no_chance()={non_chance_max} against the real game.")
+
+
+def check_reward_alignment_once(game: JaxGame):
+  """check_reward_alignment, skipped if this game was already checked in this process."""
+  name = game.to_compact_str()
+  if name in _CHECKED_GAMES:
+    return
+  _CHECKED_GAMES.add(name)
+  check_reward_alignment(game)
+
+
 @dataclass
 class BufferTimeStep():
   """Same structure as TimeStep, only
@@ -99,6 +203,10 @@ class ReplayBuffer():
     # they are skipped and only the next outcome sampled from it 
     # is stored.
     self.non_chance_trajectory_max = self.game.max_trajectory_lenght_no_chance()
+    #A game whose declared lengths do not match its real trajectories silently loses
+    # reward, which looks like a learner that simply refuses to improve rather than
+    # like an error. Cheap enough to always pay, once per game per process.
+    check_reward_alignment_once(self.game)
     self.batch_size = batch_size
     self.total_minibatch_size = batch_size * self.non_chance_trajectory_max
     #If we supply replay ratio < 1, it is assumed
@@ -486,20 +594,15 @@ class ActorReplayBuffer(ReplayBuffer):
       return new_carry, (timestep, is_chance)
     _, ys = _sample_trajectory(init_carry, actor_network, trajectory_key)
     timestep, is_chance = ys
-    #For the rewards, playing action at chance node can give a valid reward,
-    # but playing into a chance node never does. Hence, we must shift the mask by one step forward
-    next_chance = jnp.roll(is_chance, 1, axis=0)
     #This is used to remove the chance nodes from the trajectory
     non_chance = jnp.nonzero(~is_chance, size=self.non_chance_trajectory_max)[0]
     filtered_timestep = jax.tree.map(lambda x: jnp.take_along_axis(x, jnp.expand_dims(non_chance, axis=range(1, x.ndim)), axis=0).astype(x.dtype), timestep)
-    
-    
-    non_next_chance = jnp.nonzero(~next_chance, size=self.non_chance_trajectory_max)[0]
+
     non_chance_timestep = ActorCriticTimeStep(obs= filtered_timestep.obs,
                                     legal=filtered_timestep.legal,
                                     action=filtered_timestep.action,
                                     policy = filtered_timestep.policy,
-                                    reward = jnp.take_along_axis(timestep.reward, non_next_chance, axis=0).astype(timestep.reward.dtype),
+                                    reward = filter_chance_rewards(timestep.reward, is_chance, self.non_chance_trajectory_max),
                                     valid = filtered_timestep.valid)
 
     #[Trajectory, ...]
