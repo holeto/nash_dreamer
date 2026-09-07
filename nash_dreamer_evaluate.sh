@@ -35,8 +35,6 @@ scale_factor=${SCALE_FACTOR:-$scale_factor}
 #Root folder of the trained networks
 : ${BASE_PATH:="trained_networks"}
 
-: ${ALGOS:="(NashDreamer,RNaD)"}
-
 : ${ALGO_DIRS:="NashDreamer=nash_dreamer_rnad RNaD=rnad"}
 
 : ${SEEDS:="(42, 99, 160, 308, 150, 999, 616, 19, 1000, 513)"}

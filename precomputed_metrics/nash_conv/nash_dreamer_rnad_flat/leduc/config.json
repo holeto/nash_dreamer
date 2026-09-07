@@ -1,0 +1,120 @@
+{
+  "wm_config": {
+    "batch_size": 64,
+    "encoded_classes": 1,
+    "encoded_categories": 34,
+    "use_original_infoset": true,
+    "report_gradnorms": true,
+    "beta_prediction": 1.0,
+    "beta_dynamics": 0.1,
+    "beta_representation": 0.01,
+    "beta_infoset": 1.0,
+    "free_bits_clip_threshold": 0.2,
+    "uniform_mix": 0.01,
+    "bin_range": 20,
+    "sequential_network_details": [
+      -1,
+      256,
+      1
+    ],
+    "encoder_network_details": [
+      256,
+      256,
+      1
+    ],
+    "infoset_network_details": [
+      -1,
+      256,
+      1
+    ],
+    "infoset_decoder_details": [
+      256,
+      1
+    ],
+    "infoset_predictor_details": [
+      256,
+      1
+    ],
+    "decoder_network_details": [
+      256,
+      1
+    ],
+    "observer_network_details": [
+      256,
+      1
+    ],
+    "dynamics_network_details": [
+      256,
+      1
+    ],
+    "reward_predictor_network_details": [
+      256,
+      1
+    ],
+    "done_predictor_network_details": [
+      256,
+      1
+    ],
+    "legal_actions_network_details": [
+      256,
+      1
+    ],
+    "obs_loss_bce": false
+  },
+  "ac_config": {
+    "train_real_policy": true,
+    "report_gradnorms": true,
+    "beta_imagination": 1.0,
+    "beta_real": 1.0,
+    "actor_network_details": [
+      256,
+      1
+    ],
+    "critic_network_details": [
+      256,
+      1
+    ],
+    "entropy_schedule_repeats": [
+      1
+    ],
+    "entropy_schedule_size": [
+      1000
+    ],
+    "eta": 0.2,
+    "cf_is_clip": 100.0,
+    "rho_vtrace": Infinity,
+    "c_vtrace": 1.0,
+    "gamma_vtrace": 1.0,
+    "lambda_vtrace": 1.0,
+    "num_starts": -1,
+    "neurd_clip": 10000,
+    "neurd_threshold": 2,
+    "sampling_epsilon": 0.2,
+    "state_sample_threshold": 0.05,
+    "terminal_threshold": 0.5,
+    "legal_threshold": 0.5,
+    "bin_range": 20,
+    "wm_warm_up_period": 1000,
+    "target_network_update": 0.001
+  },
+  "buffer_config": {
+    "buffer_size": 64,
+    "sampling_epsilon": 0.2,
+    "replay_ratio": -1,
+    "return_log_frequency": 10,
+    "smoothing_window": 64,
+    "log_returns": false
+  },
+  "optimizer_config": {
+    "lr": 0.0003,
+    "agc": 0.3,
+    "eps": 1e-08,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "momentum": true,
+    "nesterov": false,
+    "schedule": "const",
+    "warmup": 1000,
+    "anneal": 0
+  }
+}

@@ -9,6 +9,8 @@ import numpy as np
 from train_utils import load_model, parse_sequence, track
 from dreamer_ma import DreamerMA
 from sim_rnad import SimRNaD
+from sim_mmd import SimMMD
+from sim_ppo import SimPPO
 from experiments.policy_eval_utils import head_to_head_play
 
 
@@ -38,11 +40,12 @@ def _config_to_dict(model):
             'buffer_config': dataclasses.asdict(model.buffer_config),
             'optimizer_config': dataclasses.asdict(model.opt_config),
         }
-    elif isinstance(model, SimRNaD):
-        return {
-            'config': dataclasses.asdict(model.config),
-            'buffer_config': dataclasses.asdict(model.buffer_config),
-        }
+    elif isinstance(model, (SimRNaD, SimMMD, SimPPO)):
+        out = {'config': dataclasses.asdict(model.config)}
+        #SimPPO has no replay buffer, hence no buffer_config
+        if hasattr(model, "buffer_config"):
+            out['buffer_config'] = dataclasses.asdict(model.buffer_config)
+        return out
     return {}
 
 @track
@@ -76,7 +79,7 @@ def main():
         print(f"Skipping {model_path} (not found)")
         continue
       model = load_model(model_path)
-      assert isinstance(model, (DreamerMA, SimRNaD)), f"Expected DreamerMA or SimRNaD, got {type(model)}"
+      assert isinstance(model, (DreamerMA, SimRNaD, SimMMD, SimPPO)), f"Expected DreamerMA, SimRNaD, SimMMD or SimPPO, got {type(model)}"
       models[seed] = model
 
   if not models_a or not models_b:

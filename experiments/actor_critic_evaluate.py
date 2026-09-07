@@ -96,7 +96,7 @@ def get_metrics_from_dir(model_dir, args):
             model = load_model(model_path)
             if isinstance(model, DreamerMA):
                 pass
-            elif isinstance(model, SimRNaD):
+            elif isinstance(model, (SimRNaD, SimMMD, SimPPO)):
                 pass
             else:
                 assert False, f"Expected DreamerMA or SimRNAD, got {model.__class__}"
@@ -142,12 +142,22 @@ def get_metrics_from_dir(model_dir, args):
     if len(steps) > 0:
         sort_indices = np.argsort(steps)
         sorted_steps = steps[sort_indices]
-        batch_size = model.wm_config.batch_size if isinstance(model, DreamerMA) else model.batch_size
-        ratio = 1 if model.buffer_config.replay_ratio <= 0 else model.buffer_config.replay_ratio
-        env_steps = sorted_steps * ((batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio)
+        env_steps = sorted_steps * _env_steps_per_grad_step(model)
         return env_steps, metrics[sort_indices], game, _wm_warmup_env_step(model)
     else:
         return [], [], game, -1
+
+
+def _env_steps_per_grad_step(model):
+    """Environment steps consumed per gradient/training step, used to convert a
+    checkpoint's step count into environment steps for plotting. Shared by
+    get_metrics_from_dir and _wm_warmup_env_step so the two can never drift apart."""
+    batch_size = model.wm_config.batch_size if isinstance(model, DreamerMA) else model.batch_size
+    #SimPPO has no buffer_config: it is strictly on-policy with no replay buffer,
+    # so its replay ratio is effectively 1 (every step is freshly collected).
+    buf = getattr(model, "buffer_config", None)
+    ratio = 1 if buf is None or buf.replay_ratio <= 0 else buf.replay_ratio
+    return (batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio
 
 
 def _config_to_dict(model):
@@ -159,11 +169,12 @@ def _config_to_dict(model):
             'buffer_config': dataclasses.asdict(model.buffer_config),
             'optimizer_config': dataclasses.asdict(model.opt_config),
         }
-    elif isinstance(model, SimRNaD):
-        return {
-            'config': dataclasses.asdict(model.config),
-            'buffer_config': dataclasses.asdict(model.buffer_config),
-        }
+    elif isinstance(model, (SimRNaD, SimMMD, SimPPO)):
+        out = {'config': dataclasses.asdict(model.config)}
+        #SimPPO has no replay buffer, hence no buffer_config
+        if hasattr(model, "buffer_config"):
+            out['buffer_config'] = dataclasses.asdict(model.buffer_config)
+        return out
     return {}
 
 
@@ -175,10 +186,7 @@ def _wm_warmup_env_step(model):
     warm_up_grad_steps = model.ac_config.wm_warm_up_period
     if warm_up_grad_steps <= 0:
         return -1
-    batch_size = model.wm_config.batch_size
-    ratio = 1 if model.buffer_config.replay_ratio <= 0 else model.buffer_config.replay_ratio
-    env_step_per_grad_step = (batch_size * model.game.max_trajectory_lenght_no_chance()) / ratio
-    return float(warm_up_grad_steps * env_step_per_grad_step)
+    return float(warm_up_grad_steps * _env_steps_per_grad_step(model))
 
 
 def _wm_warmup_env_step_from_dir(model_dir):

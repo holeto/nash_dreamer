@@ -13,6 +13,7 @@ from ma_rssm import *
 from replay_buffer import WMReplayBuffer
 from dreamer_actor_critic import DreamerActorCritic
 from rnad_dreamer import RNaDDreamer
+from mmd_dreamer import MMDDreamer
 
 
 
@@ -63,7 +64,12 @@ class DreamerMA():
     # we compute manually in actor critic will handle
     # the EMA updates for us.
     target_tx = optax.sgd(self.ac_config.target_network_update)
-    if ma_rssm.use_rnad:
+    #Dispatch on the config type rather than adding another flag to MARSSM,
+    # so that ma_rssm.py needs no change. use_rnad stays correct, it is False
+    # for an MMDConfig and nothing else reads it.
+    if isinstance(self.ac_config, MMDConfig):
+      ctor = MMDDreamer
+    elif ma_rssm.use_rnad:
       ctor = RNaDDreamer
     else:
       ctor = DreamerActorCritic
@@ -211,7 +217,15 @@ class DreamerMA():
       dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
       l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
       #[Trajectory, Batch]
-      repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+      if self.wm_config.l2_posterior:
+        # VQ-VAE style commitment loss: instead of pulling the posterior toward the prior,
+        # sharpen it toward its own per-variable argmax (a stop-gradient one-hot target) --
+        # cross entropy between the posterior and that target, independent of the prior.
+        argmax_target = jax.lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
+        repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
+      else:
+        repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
       #Contrastive loss, we want to

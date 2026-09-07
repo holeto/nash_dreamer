@@ -1,0 +1,49 @@
+{
+  "config": {
+    "report_gradnorms": false,
+    "num_epochs": 7,
+    "clip_epsilon": 0.1,
+    "kl_coeff": 0.05,
+    "magnet_coeff": 0.2,
+    "adv_norm_eps": 1e-08,
+    "gamma": 1.0,
+    "td_lambda": 1.0,
+    "actor_network_details": [
+      256,
+      1
+    ],
+    "critic_network_details": [
+      256,
+      1
+    ],
+    "bin_range": 20,
+    "target_network_update": 0.001,
+    "train_real_policy": false,
+    "beta_imagination": 1.0,
+    "beta_real": 0.3,
+    "num_starts": -1,
+    "wm_warm_up_period": 1000,
+    "sampling_epsilon": 0.0,
+    "state_sample_threshold": 0.05,
+    "terminal_threshold": 0.5,
+    "legal_threshold": 0.5
+  },
+  "buffer_config": {
+    "buffer_size": 64,
+    "sampling_epsilon": 0.0,
+    "replay_ratio": -1,
+    "return_log_frequency": 10,
+    "smoothing_window": 64,
+    "log_returns": true,
+    "number_of_negatives": 5
+  },
+  "model_class": "SimMMD",
+  "learner_steps": 30000,
+  "batch_size": 64,
+  "replay_ratio": -1,
+  "trajectory_length": 18,
+  "env_steps_per_grad_step": 1152.0,
+  "wm_warmup_env_step": -1,
+  "algo_dir": "mmd",
+  "game_name": "phantom_ttt"
+}

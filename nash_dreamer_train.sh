@@ -61,8 +61,16 @@ print_each=${PRINT_EACH:=$print_each}
 : ${CAT_FLAGS:=$base_cat_flags}
 : ${WM_ADD_FLAGS:=""}
 : ${WM_FLAGS:="--free_bits_threshold 1.0 --beta_representation 0.1 --batch_size 64"}
-# Additional actor critic flags
-: ${ALGO_FLAGS:="--eta 0.2"}
+# Additional actor critic flags. These are the flags of the chosen
+# train_mode subcommand, so the sensible default differs per algorithm:
+# MMD has no --eta, and reinforce/rnad have none of the MMD parameters.
+# Setting ALGO_FLAGS explicitly still overrides this.
+if [ "$ALGO" == "mmd" ]; then
+    algo_default_flags="--num_epochs 4 --clip_epsilon 0.2 --kl_coeff 0.1 --magnet_coeff 0.05"
+else
+    algo_default_flags="--eta 0.2"
+fi
+: ${ALGO_FLAGS:=$algo_default_flags}
 : ${AC_ADD_FLAGS:=""}
 : ${AC_FLAGS:="--beta_imagination 1.0 --beta_real 0.3"}
 # Additional optimizer flags

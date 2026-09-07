@@ -1,5 +1,5 @@
 # Byte-compiled / optimized / DLL files
-__pycache__/
+**/*/__pycache__/
 *.py[codz]
 *$py.class
 
@@ -201,7 +201,30 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+#Project specific folders that we do not want to include
+debug/
+plots/
+local_plotting/
+world_model_plots/
+tabular/
+cluster*/
+**/*/debug/
+**/*/cluster*/
+#Default path to store models
+**/*/trained_networks/
+trained_networks/
+#Model checkpoints
+**/*/step_*.pkl
+#Default storing for the Phantom-Tic-Tac-Toe strategies/structures
+**/*/ptt_strategies/
+**/*/ptt_treeplex/
+ptt_strategies/
+ptt_treeplex
+tests/
+texts/

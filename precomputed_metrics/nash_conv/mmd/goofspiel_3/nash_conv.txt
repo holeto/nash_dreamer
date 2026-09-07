@@ -1,0 +1,13 @@
+algo_name: MMD
+game_name: goofspiel_3
+game_str: goofspiel Param: num_cards value: 3
+metric: nash_conv
+smoothing_window: -1
+wm_warmup_env_step: -1
+uniform_nash_conv: 1.3333333730697632
+seed: 42
+steps: 0.0 19200.0 38400.0
+values: 1.3333333730697632 0.003389496990678793 0.00642744168288669
+seed: 99
+steps: 0.0 19200.0 38400.0
+values: 1.3333333730697632 0.003869190484714619 0.001040746314013014

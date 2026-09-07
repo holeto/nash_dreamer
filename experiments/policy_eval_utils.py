@@ -18,9 +18,11 @@ from games.model_game import DreamerModelGame, ModelGameState, InformedRealGame
 
 from dreamer_ma import DreamerMA
 from sim_rnad import SimRNaD, ACNetwork
+from sim_mmd import SimMMD
+from sim_ppo import SimPPO
 from ma_rssm import MARSSM
 
-def extract_model_policy(model: DreamerMA|SimRNaD|None, game: JaxGame | DreamerModelGame, uniform=False)-> tuple[list, list]:
+def extract_model_policy(model: DreamerMA|SimRNaD|SimMMD|SimPPO|None, game: JaxGame | DreamerModelGame, uniform=False)-> tuple[list, list]:
   """Extracts policies for the whole game from the RNaD model and 
   returns them as per depth
   infoset map and behavioral policies. Can also instead
@@ -248,7 +250,7 @@ def compare_policies(game: JaxGame| DreamerModelGame, given_pols: tuple[list, li
   _tree_walk(init_state)
        
 
-def model_best_response(model: DreamerMA| SimRNaD|None, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None):
+def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None):
   """Compute counterfactual best response policies for both players and their 
   respective values.Returned as br value of p2 against p1
   , br value of p1 against p2, p1_br_policy, p2_br_policy.
