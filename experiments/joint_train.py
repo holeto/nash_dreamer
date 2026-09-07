@@ -5,6 +5,7 @@ from shutil import rmtree
 from dreamer_ma import DreamerMA, DreamerMAConfig, LATEST_STEP_FILENAME
 from sim_rnad import SimRNaD
 from sim_mmd import SimMMD
+from sim_ppo import SimPPO
 from games.jax_game import JaxGame
 from train_utils import *
   
@@ -42,6 +43,7 @@ def train_nash_dreamer(args, game: JaxGame):
 
       jsd=args.jsd,
       max_divergence_scaling = args.max_divergence_scaling,
+      l2_posterior = args.l2_posterior,
       
       #Contrastive loss parameters
       contrastive_temperature = args.contrastive_temperature,
@@ -119,6 +121,56 @@ def train_nash_dreamer(args, game: JaxGame):
         
         target_network_update = args.target_network_update
     )
+  elif args.train_mode == "mmd":
+    ac_config = MMDConfig(
+        bin_range = args.ac_bin_range,
+        train_real_policy = args.train_real_policy,
+        report_gradnorms = args.report_gradnorms,
+
+        beta_imagination = args.beta_imagination,
+        beta_real = args.beta_real,
+
+        sampling_epsilon=args.img_sampling_epsilon,
+
+        num_starts = args.num_starts,
+
+        #World model extraction parameters
+        state_sample_threshold=args.state_sample_threshold,
+        terminal_threshold = args.terminal_threshold,
+        legal_threshold = args.legal_threshold,
+        wm_warm_up_period = args.wm_warm_up,
+
+        #MMD/PPO parameters
+        num_epochs = args.num_epochs,
+        clip_epsilon = args.clip_epsilon,
+        kl_coeff = args.kl_coeff,
+        magnet_coeff = args.magnet_coeff,
+        adv_norm_eps = args.adv_norm_eps,
+
+        #TD(lambda)/GAE parameters
+        gamma = args.gamma,
+        td_lambda = args.td_lambda,
+
+        # Ordered as (hidden_layer_features, num_hidden_layers)
+        actor_network_details = (args.actor_hidden_features, args.actor_hidden_layers),
+        critic_network_details = (args.critic_hidden_features, args.critic_hidden_layers),
+
+        target_network_update = args.target_network_update
+    )
+    #MMD takes the stored behaviour policy as pi_old, so it is only on-policy if
+    # the real trajectories are freshly collected without a uniform mixture. The
+    # imagination side of this check lives in MMDDreamer.init, which is where the
+    # actor-critic config is in scope.
+    if args.train_real_policy and buffer_config.replay_ratio >= 1:
+      print(f"Warning! MMD is on-policy and --train_real_policy is set, but replay_ratio="
+            f"{buffer_config.replay_ratio} >= 1. The real policy loss then sees replayed off-policy "
+            f"trajectories, and MMD carries no importance sampling correction for them beyond the "
+            f"PPO clipping. Supply --replay_ratio -1 for strictly on-policy MMD.")
+    if args.train_real_policy and buffer_config.sampling_epsilon > 0:
+      print(f"Warning! MMD is on-policy and --train_real_policy is set, but real_sampling_epsilon="
+            f"{buffer_config.sampling_epsilon} > 0. The stored real behaviour policy is an "
+            f"epsilon-uniform mixture, so pi_old is not the policy of the actor at collection time "
+            f"and the policy ratio is not 1 at the first inner epoch. Supply --real_sampling_epsilon 0.")
   else:
     ac_config = ActorCriticConfig(
 
@@ -161,13 +213,13 @@ def train_nash_dreamer(args, game: JaxGame):
     train_loop(args, seed, model)
 
 @track
-def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD):
+def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD|SimPPO):
   """Run the actual training loop
 
   Args:
       args (_type_): Argument specification. Detailed description of arguments can be found in parsing_utils.py
       seed (int): The PRNG seed for this training instance
-      template_model (DreamerMA|SimRNaD|SimMMD): A precreated template model, that has the same
+      template_model (DreamerMA|SimRNaD|SimMMD|SimPPO): A precreated template model, that has the same
       configuration as all the models during the training, except seed. This is used
       to just update the network/optimizer state and seed of the template model
       instead of initializing new one each time, to avoid unnnecessary retracing.
@@ -180,6 +232,9 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD):
         model_root_dir = f"nash_dreamer_{args.train_mode}"
       elif isinstance(template_model, SimMMD):
         model_root_dir = f"mmd"
+      elif isinstance(template_model, SimPPO):
+        #Keep the two players' best responses in separate directories
+        model_root_dir = f"ppo_p{template_model.player_id}"
       else:
         model_root_dir = f"rnad"
   
@@ -205,7 +260,7 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD):
   if saved_model_file:
     print(f"Loading model from path {saved_model_file}")
     model = load_model(saved_model_file)
-    assert isinstance(model, DreamerMA| SimRNaD| SimMMD), f"The loaded model should be a DreamerMA, SimRNaD or SimMMD instance, not {model.__class__}"
+    assert isinstance(model, DreamerMA| SimRNaD| SimMMD| SimPPO), f"The loaded model should be a DreamerMA, SimRNaD, SimMMD or SimPPO instance, not {model.__class__}"
     assert seed == model.init_seed, f"The given seed {seed} and the initial seed of the stored model {model.init_seed} do not match."
 
   else:
@@ -214,6 +269,11 @@ def train_loop(args, seed:int, template_model: DreamerMA|SimRNaD|SimMMD):
       model = DreamerMA(template_model.wm_config, template_model.buffer_config, template_model.ac_config, template_model.opt_config, game, seed)
     elif isinstance(template_model, SimMMD):
       model = SimMMD(template_model.game, template_model.config, template_model.opt_config, template_model.buffer_config, seed, template_model.batch_size)
+    elif isinstance(template_model, SimPPO):
+      #SimPPO takes the frozen opponent instead of a buffer config. Passing the already
+      # extracted actor avoids reloading the opponent checkpoint for every seed.
+      model = SimPPO(template_model.game, template_model.config, template_model.opt_config,
+                     template_model.opponent_actor, seed, template_model.batch_size)
     else:
       model = SimRNaD(template_model.game, template_model.config, template_model.opt_config, template_model.buffer_config, seed, template_model.batch_size)
   #Will still retrace the nnx networks.

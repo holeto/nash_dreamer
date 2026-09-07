@@ -1,0 +1,46 @@
+{
+  "config": {
+    "train_real_policy": false,
+    "report_gradnorms": false,
+    "beta_imagination": 1.0,
+    "beta_real": 0.3,
+    "actor_network_details": [
+      256,
+      1
+    ],
+    "critic_network_details": [
+      256,
+      1
+    ],
+    "entropy_schedule_repeats": [
+      1
+    ],
+    "entropy_schedule_size": [
+      1000
+    ],
+    "eta": 0.2,
+    "cf_is_clip": 100.0,
+    "rho_vtrace": Infinity,
+    "c_vtrace": 1.0,
+    "gamma_vtrace": 1.0,
+    "lambda_vtrace": 1.0,
+    "num_starts": -1,
+    "neurd_clip": 10000,
+    "neurd_threshold": 2,
+    "sampling_epsilon": 0.2,
+    "state_sample_threshold": 0.05,
+    "terminal_threshold": 0.5,
+    "legal_threshold": 0.5,
+    "bin_range": 20,
+    "wm_warm_up_period": 1000,
+    "target_network_update": 0.001
+  },
+  "buffer_config": {
+    "buffer_size": 512,
+    "sampling_epsilon": 0.2,
+    "replay_ratio": 8,
+    "return_log_frequency": 10,
+    "smoothing_window": 64,
+    "log_returns": false
+  }
+}

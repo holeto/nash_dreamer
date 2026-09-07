@@ -90,7 +90,7 @@ def render_tree(root: Node, model: DreamerMA, suffix: str = ""):
     tree_save_dir = os.getcwd() + "/" +  tree_save_dir
     os.makedirs(tree_save_dir, exist_ok=True)
 
-    output_filename = tree_save_dir + f"step_{model.learner_steps}{suffix}.png"
+    output_filename = tree_save_dir + f"step_{model.learner_steps}{suffix}.pdf"
     exporter = DotExporter(root,
                            nodeattrfunc=custom_node_style,
                            #nodenamefunc= custom_node_name,

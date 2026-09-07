@@ -57,6 +57,7 @@ def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   ##Distribution loss parameters
   parser.add_argument("--jsd", action="store_true", default=False, help="Use Jensen-Shannon divergence for the dynamics and representation losses instead of KL-divergence.")
   parser.add_argument("--max_divergence_scaling", action="store_true", default=False, help="Scale the contrastive and reconstruction losses by the maximum value of the prior/posterior loss.")
+  parser.add_argument("--l2_posterior", action="store_true", default=False, help="Replace the representation loss with a VQ-VAE style commitment loss: cross entropy between the posterior and its own per-variable argmax (stop-gradient one-hot), sharpening the posterior toward a deterministic code instead of pulling it toward the prior.")
 
   ##Contrastive loss parameters
   parser.add_argument("--number_of_negatives", type=int, default=5, help="Number of negative samples to use for the contrastive loss. Always >= 1.")
@@ -198,6 +199,9 @@ def add_nash_dreamer_arguments(parser: ArgumentParser):
   nd_rnad_parser = subparsers.add_parser(name="rnad", help="Train both world model and RNaD as the actor-critic.")
   nd_rnad_parser = add_rnad_arguments(nd_rnad_parser)
 
+  nd_mmd_parser = subparsers.add_parser(name="mmd", help="Train both world model and MMD as the actor-critic.")
+  nd_mmd_parser = add_mmd_arguments(nd_mmd_parser)
+
   return parser
 
 def add_mmd_arguments(parser: ArgumentParser) ->ArgumentParser:
@@ -208,6 +212,25 @@ def add_mmd_arguments(parser: ArgumentParser) ->ArgumentParser:
   parser.add_argument("--clip_epsilon", type=float, default=0.2, help="The PPO clipping parameter for the policy ratio.")
   parser.add_argument("--kl_coeff", type=float, default=0.1, help="Weight of the explicit mirror descent proximal term KL(pi || pi_old).")
   parser.add_argument("--magnet_coeff", type=float, default=0.05, help="Weight of the magnet term KL(pi || uniform), which with a uniform magnet is an entropy exploration bonus. THE PARAMETER TO SWEEP PER GAME, it sets the temperature of the quantal response equilibrium MMD converges to. Games with a pure equilibrium want it small (goofspiel_3 reaches nash_conv 0.0000 anywhere in [0, 0.2] but 0.9534 at 1.0), games with a mixed equilibrium want it large (RPS reaches 0.105 at 1.0 but 1.784 at 0.2). It lives on the scale of the normalized advantage, so do not carry the much smaller RNaD eta over to it.")
+  parser.add_argument("--adv_norm_eps", type=float, default=1e-8, help="Numerical stability term for the PPO advantage normalization.")
+
+  ##TD(lambda)/GAE parameters
+  parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for the TD(lambda)/GAE estimate.")
+  parser.add_argument("--td_lambda", type=float, default=0.95, help="Lambda parameter for the TD(lambda)/GAE estimate.")
+
+  return parser
+
+def add_ppo_arguments(parser: ArgumentParser) ->ArgumentParser:
+  """Add all the single agent PPO best-response arguments to the given parser."""
+
+  ##Opponent to best respond to
+  parser.add_argument("--opponent_path", type=str, required=True, help="Path to the trained opponent checkpoint (a step_N.pkl of a DreamerMA, SimRNaD or SimMMD). The opponent is frozen and never trained.")
+  parser.add_argument("--player_id", type=int, default=0, help="Which player the best response is learned for. The stored reward is from player 0's perspective and is negated for player 1.")
+
+  ##PPO parameters
+  parser.add_argument("--num_epochs", type=int, default=4, help="Number of inner gradient steps taken on each collected on-policy batch.")
+  parser.add_argument("--clip_epsilon", type=float, default=0.2, help="The PPO clipping parameter for the policy ratio.")
+  parser.add_argument("--entropy_coeff", type=float, default=0.0, help="Weight of the entropy exploration bonus. Defaults to 0 on purpose: entropy regularization softens the best response, which UNDER-estimates the opponent's exploitability. Keep it at or near zero when the best-response value is the number you want.")
   parser.add_argument("--adv_norm_eps", type=float, default=1e-8, help="Numerical stability term for the PPO advantage normalization.")
 
   ##TD(lambda)/GAE parameters
@@ -255,6 +278,17 @@ def add_sim_rnad_arguments(parser: ArgumentParser):
   parser = add_rnad_arguments(parser)
   return parser
 
+def add_sim_ppo_arguments(parser: ArgumentParser):
+  """Prepares a parser that will run the single agent PPO best-response learner.
+  Note it reuses the standalone block, so the replay flags (--buffer_size,
+  --replay_ratio, --log_returns) are accepted but unused: PPO is strictly on-policy
+  and has no replay buffer. --smoothing_window and --return_log_frequency DO apply,
+  they control the best-response value estimate."""
+  parser = add_standalone_training_arguments(parser)
+  #PPO specific arguments
+  parser = add_ppo_arguments(parser)
+  return parser
+
 def add_sim_mmd_arguments(parser: ArgumentParser):
   """Prepares a parser, that will run MMD only without the world model."""
   parser = add_standalone_training_arguments(parser)
@@ -276,5 +310,8 @@ def prepare_experiment_parser():
 
   mmd_parser = subparsers.add_parser('mmd', help='Run MMD training on the real environment without the world model')
   add_sim_mmd_arguments(mmd_parser)
+
+  ppo_parser = subparsers.add_parser('ppo', help='Train a single agent PPO approximate best response against a frozen trained opponent')
+  add_sim_ppo_arguments(ppo_parser)
 
   return parser

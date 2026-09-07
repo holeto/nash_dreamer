@@ -217,6 +217,71 @@ class MMDConfig:
 
   target_network_update: float = 1e-3
 
+  #Fields used only by the Dreamer integration (MMDDreamer). The standalone
+  # SimMMD learner ignores all of them, exactly as RNaDConfig serves both
+  # SimRNaD and RNaDDreamer from a single dataclass.
+  train_real_policy: bool = False # Whether to train policy also on real trajectories
+  beta_imagination: float = 1.0
+  beta_real: float = 0.3 # Coeficients for the loss parts. Beta imagination is used for Dreamer
+                          # unrolled trajectories and beta real for trajectories from the real environment
+  num_starts: int = -1 #How many starting points to take from each trajectory for the imagination unroll. If -1 take the same amount as the length of the trajectory.
+  wm_warm_up_period: int = 1000 #How many steps to let the world model "warm-up" and only train on real trajectories, before starting to imagine.
+  #Uniform policy mixture used during IMAGINATION (the --img_sampling_epsilon flag).
+  # Nonzero means the imagined behaviour policy stored in the timestep is not the
+  # policy of the actor itself, so the MMD ratio is not 1 at the first inner epoch.
+  sampling_epsilon: float = 0.0
+  state_sample_threshold: float = 0.05 #A threshold when sampling states. The outcomes for
+                                        #each categorical below this threshold are ignored (or, specificaly a minimum
+                                        # of this threshold and the lowest of max probability outcomes of the categoricals).
+  terminal_threshold: float = 0.5 #Thresholds when to consider the state terminal, or the actions
+  legal_threshold: float = 0.5    # Legal, when we take the sigmoid over the Dreamer produced logits.
+
+
+@chex.dataclass(frozen=True)
+class PPOConfig:
+  """Configuration of the single agent PPO best-response learner (sim_ppo.SimPPO).
+  It trains one player against a frozen opponent, so unlike MMD it has neither the
+  magnet term nor the explicit proximal KL, only the standard clipped surrogate
+  plus an optional entropy exploration bonus."""
+
+  report_gradnorms: bool = False #Whether to report gradient norms.
+
+  #Which player the best response is learned for. The stored reward is from the
+  # perspective of player 0, so for player_id 1 it is negated.
+  player_id: int = 0
+
+  #PPO parameters
+  num_epochs: int = 4 #Number of inner gradient steps taken on each collected on-policy batch
+  clip_epsilon: float = 0.2 #The PPO clipping parameter for the policy ratio
+  #Weight of the entropy exploration bonus. Deliberately defaults to 0: entropy
+  # regularization makes the best response softer, which UNDER-estimates the
+  # exploitability of the opponent. Keep it at or near zero whenever the
+  # best-response value is the number you actually want.
+  entropy_coeff: float = 0.0
+  adv_norm_eps: float = 1e-8 #Numerical stability term for the advantage normalization
+
+  #TD(lambda)/GAE parameters
+  gamma: float = 1.0 # Discount factor
+  td_lambda: float = 0.95 #Same as TD-learning lambda
+
+  #Uniform policy mixture applied to the LEARNER during collection. The frozen
+  # opponent is always queried at its true policy, since the point is to best
+  # respond to that policy and not to a mixture of it.
+  sampling_epsilon: float = 0.0
+
+  #Ordered as hidden layer size, num hidden layers
+  actor_network_details: Tuple[int, int] = (256, 1)
+  critic_network_details: Tuple[int, int] = (256, 1)
+
+  bin_range: int = 20 #Number of the exponentially spaced bins for the value categorical distribution prediction
+
+  target_network_update: float = 1e-3
+
+  #Return logging. There is no replay buffer here to do it, but the learner's mean
+  # episode return IS the best-response value estimate, so it is tracked directly.
+  smoothing_window: int = 64
+  return_log_frequency: int = 10
+
 
 @chex.dataclass(frozen=True)
 class DreamerMAConfig():
@@ -240,6 +305,10 @@ class DreamerMAConfig():
   #Distributional loss parameters
   jsd: bool =False #Whether to use JSD or KL for the prior/posterior distance
   max_divergence_scaling: bool = False #Whether to scale the prior/posterior distance
+  l2_posterior: bool = False #If True, replace the representation loss with a VQ-VAE style
+                              # commitment loss (cross entropy between the posterior and its
+                              # own per-variable argmax), sharpening the posterior toward a
+                              # deterministic code instead of pulling it toward the prior.
   
   #Contrastive loss parameters
   contrastive_temperature: float = 0.1 #Temperature parameter for the contrastive loss.
@@ -324,33 +393,54 @@ def symlog(x: chex.Array):
 def symexp(x: chex.Array):
   return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1)
 
+def _legal_shifted_logit(logit: chex.Array, legal: chex.Array):
+  """Shift the logits by the maximum over the LEGAL actions, and return that shift
+  together with the softmax normalization over legal actions.
+
+  Shifting by the legal maximum instead of the global one guarantees that the best
+  legal action contributes exp(0) = 1, so the normalization is always at least 1 and
+  can never underflow. Softmax is invariant to the choice of shift, so in the
+  well-conditioned case this is the same policy as before to within float32 rounding.
+
+  It matters because illegal actions receive no gradient -- the policy is masked to
+  zero there -- so their logits drift freely, and in games where an action is illegal
+  in one state but the network's favourite in another (a card already played, a cell
+  already shot) they grow without bound. Shifting by the GLOBAL maximum then subtracts
+  an illegal action's logit from every legal one. Once the gap passes about 88 every
+  legal exp() underflows: the normalization enters the denormal range, where the
+  backward pass divides by it and produces NaN, and past about 90 it reaches exactly
+  zero, where the policy becomes all-zero and its gradient silently becomes zero too.
+  An all-zero policy also makes jax.random.choice return action 0 every time, which
+  turns the whole rollout into a single degenerate line."""
+  chex.assert_equal_shape([logit, legal])
+  masked_logit = jnp.where(legal > 0, logit, -jnp.inf)
+  max_legal = jnp.max(masked_logit, axis=-1, keepdims=True)
+  #Fall back to no shift if a state has no legal action at all. That must not happen
+  # (see the replay buffer's requirements on the legal mask) but -inf here would poison
+  # the whole row rather than just that state.
+  max_legal = jnp.where(jnp.isfinite(max_legal), max_legal, 0.0)
+  #Clamped at 0 so illegal logits above the legal maximum cannot overflow exp. Legal
+  # entries are all <= 0 by construction, so for them this is a no-op.
+  shifted_logit = jnp.minimum(logit - max_legal, 0.0)
+  exp_logit = jnp.where(legal > 0, jnp.exp(shifted_logit), 0.0)
+  normalization = jnp.sum(exp_logit, axis=-1, keepdims=True)
+  return shifted_logit, exp_logit, normalization
+
 def legal_policy(logit: chex.Array, legal: chex.Array):
   """Get a softmaxed policy out of logit, with
   zeros at illegal actions. Assumes that these have actions in the last
   dimension and the same shape."""
-  chex.assert_equal_shape([logit, legal])
-  shifted_logit = logit - logit.max(axis=-1, keepdims=True)
-  exp_logit = jnp.exp(shifted_logit)
-  #The only way this can potentially break is 
-  # if +- inf or NaN appears already in the exp_logit
-  # at which point it is an error in the network
-  masked_exp_logit = exp_logit * legal
-  normalization = jnp.sum(masked_exp_logit, axis=-1, keepdims=True)
-  policy = masked_exp_logit / (normalization + (normalization == 0))
+  _, exp_logit, normalization = _legal_shifted_logit(logit, legal)
+  policy = exp_logit / (normalization + (normalization == 0))
   return policy
 
 def legal_log_policy(logit: chex.Array, legal: chex.Array):
   """Uses a legal_policy to get the masked policy
   and then return a log of it, with the exception
-  of illegal actions which have 0 instead of -inf. 
+  of illegal actions which have 0 instead of -inf.
   Assumes that these have actions in the last
   dimension and the same shape."""
-  chex.assert_equal_shape([logit, legal])
-  shifted_logit = logit - logit.max(axis=-1, keepdims=True)
-  exp_logit = jnp.exp(shifted_logit)
-  masked_exp_logit = exp_logit * legal
-  
-  normalization = jnp.sum(masked_exp_logit, axis=-1, keepdims=True)
+  shifted_logit, _, normalization = _legal_shifted_logit(logit, legal)
   log_policy = shifted_logit - jnp.log(normalization + (normalization == 0))
   legal_log_policy = jnp.where(legal > 0, log_policy, 0.0)
   return legal_log_policy
@@ -439,7 +529,7 @@ def get_value_from_bins(dist_logits: chex.Array, bin_range: int, use_symexp=True
   # to ensure summation from small to large in magnitude 
   neg_bins = bins * (bins < 0)
   v_pos_part = jnp.sum(v_probs * pos_bins, axis=-1, keepdims=True)
-  v_neg_part = jnp.sum(jnp.flip(v_probs * neg_bins), axis=-1, keepdims=True)
+  v_neg_part = jnp.sum(jnp.flip(v_probs * neg_bins, axis=-1), axis=-1, keepdims=True)
   v = v_pos_part + v_neg_part
   if use_symexp:
     v = symexp(v)

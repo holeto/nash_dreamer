@@ -221,6 +221,19 @@ class ReplayBuffer():
       self.online_trajectories = int(online_trajectories_float)
       self.online_trajectories_remainder = online_trajectories_float - self.online_trajectories
       self.replayed_batches = batch_size - self.online_trajectories
+      # By design, one online trajectory should carry non_chance_trajectory_max replayed
+      # trajectories alongside it (batch_size and replay_ratio are meant to be chosen so
+      # this divides evenly) -- so this branch runs only for replay_ratio >= 1, i.e.
+      # already non-negative. A mismatch here previously produced a real, silent
+      # difference in how many real environment steps a run consumed per gradient step
+      # relative to a non-replayed run (e.g. NashDreamer) at the same batch_size, without
+      # any error or NaN to surface it.
+      if self.online_trajectories > 0:
+        actual_ratio = self.replayed_batches / self.online_trajectories
+        if actual_ratio != self.non_chance_trajectory_max:
+          print(f"Warning! The actual ratio of replayed trajectories per real trajectory is {actual_ratio} "
+                f"with batch_size {batch_size} and replay ratio {self.config.replay_ratio}. If you are "
+                f"comparing with NashDreamer, the comparison is not 1:1")
     self.online_trajectories_accumulator = 0.0
     
     self.smoothed_returns = [0]

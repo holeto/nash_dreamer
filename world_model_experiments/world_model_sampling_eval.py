@@ -46,6 +46,12 @@ class SampleData:
     reward_errors: chex.Array
     terminal_errors: chex.Array
     legal_errors: chex.Array
+    pi: chex.Array
+    action: chex.Array
+    pred_reward: chex.Array
+    real_reward: chex.Array
+    pred_obs: chex.Array
+    real_obs: chex.Array
 
 
 class Sampler:
@@ -96,7 +102,8 @@ class Sampler:
     def imagine_trajectories(self, model: MARSSM, key) -> SampleData:
         keys = jax.random.split(key, self.batch_size)
         batch_sample_trajectory = nnx.vmap(self.imagine_trajectory, in_axes=(0, None), out_axes=1)
-        return batch_sample_trajectory(keys, model)
+        data = batch_sample_trajectory(keys, model)
+        return data
 
     def imagine_trajectory(self, key, ma_rssm: MARSSM) -> SampleData:
         init_sample_key, init_latent_sample_key, traj_key = jax.random.split(key, 3)
@@ -192,6 +199,12 @@ class Sampler:
             terminal_errors=(pred_root_terminal != start_terminal).astype(jnp.float32) * root_valid_f,
             legal_errors=(jnp.any(pred_root_legal != start_legals).astype(jnp.float32)
                          * root_valid_f * root_non_terminal_f),
+            pi=ma_rssm.get_policy_both_no_jit(model_root_obs, start_legals),
+            action=-jnp.ones((self.num_players,), dtype=jnp.int32),
+            pred_reward=pred_root_reward,
+            real_reward=start_reward,
+            pred_obs=model_root_obs,
+            real_obs=start_obs,
         )
 
         @chex.dataclass(frozen=True)
@@ -255,6 +268,29 @@ class Sampler:
 
             real_next_state, real_next_terminal, real_next_reward, real_next_legals = jax.lax.cond(
                 self.game.is_chance(carry.game_state), snap_branch, apply_branch, operand=None)
+
+            # --- Absorb any further chance node(s) reached by that action/snap into this same
+            # transition, snapping each against the SAME model_next_obs (the model's dynamics
+            # were themselves trained on chance-filtered trajectories, so one predicted
+            # observation already stands for "at the next decision/terminal state", regardless
+            # of how many raw chance hops separate it from carry.game_state -- see
+            # replay_buffer.filter_chance_rewards). Without this, a game whose chance and play
+            # nodes alternate (e.g. JaxRandomGoofspiel) leaves real_next_state sitting ON an
+            # unresolved chance node, whose zeroed-out tensors get compared against the model's
+            # genuine decision prediction one step later than they should.
+            def chance_absorb_cond(loop_state):
+                state, terminal, _, _ = loop_state
+                return jnp.logical_and(self.game.is_chance(state), jnp.logical_not(terminal))
+
+            def chance_absorb_body(loop_state):
+                state, _, reward_acc, _ = loop_state
+                next_state, next_terminal, next_reward, next_legals = snap_to_outcome(
+                    state, model_next_obs)
+                return next_state, next_terminal, reward_acc + next_reward, next_legals
+
+            real_next_state, real_next_terminal, real_next_reward, real_next_legals = jax.lax.while_loop(
+                chance_absorb_cond, chance_absorb_body,
+                (real_next_state, real_next_terminal, real_next_reward, real_next_legals))
             real_next_obs = get_obs(real_next_state)
 
             # --- Reconstruct reward/terminal/legal from the model state. ---
@@ -293,6 +329,12 @@ class Sampler:
                 reward_errors=reward_err,
                 terminal_errors=terminal_err,
                 legal_errors=legal_err,
+                pi=pi,
+                action=action,
+                pred_reward=pred_reward,
+                real_reward=real_next_reward,
+                pred_obs=model_next_obs,
+                real_obs=real_next_obs,
             )
             return new_carry, timestep
 
@@ -304,60 +346,109 @@ class Sampler:
         return full_timestep
 
 
-def aggregate(sample_datas: list[SampleData], obs_threshold: float, reward_threshold: float) -> dict:
-    """Concatenate the per-batch SampleData along the trajectory-batch axis and compute the
-    fraction of erroneous trajectories and the joint-pooled per-category mean error among them."""
-    valid = np.concatenate([np.asarray(d.valid) for d in sample_datas], axis=1)          # [T, total]
-    obs = np.concatenate([np.asarray(d.obs_errors) for d in sample_datas], axis=1)
-    reward = np.concatenate([np.asarray(d.reward_errors) for d in sample_datas], axis=1)
-    terminal_err = np.concatenate([np.asarray(d.terminal_errors) for d in sample_datas], axis=1)
-    legal = np.concatenate([np.asarray(d.legal_errors) for d in sample_datas], axis=1)
-    next_terminal = np.concatenate([np.asarray(d.next_terminal) for d in sample_datas], axis=1)
+class RunningAverage:
+    """Online weighted running average over a stream of (batch_sum, batch_n) pairs, without
+    ever holding the raw data behind them. Letting n_t be the cumulative weight after merging
+    batch t (n_0 = 0), the update is
+        avg_t = avg_{t-1} * (n_{t-1} / n_t) + batch_sum / n_t,  n_t = n_{t-1} + batch_n
+    which is algebraically the same running mean as summing every batch_sum and dividing by
+    the total weight at the end (avg_t * n_t = avg_{t-1} * n_{t-1} + batch_sum by construction),
+    just computed incrementally so only one batch's worth of data need exist at a time."""
+    def __init__(self):
+        self.avg = 0.0
+        self.n = 0
+
+    def update(self, batch_sum: float, batch_n: int):
+        new_n = self.n + batch_n
+        if new_n > 0:
+            self.avg = self.avg * (self.n / new_n) + batch_sum / new_n
+        self.n = new_n
+
+
+def compute_batch_stats(data: SampleData, obs_threshold: float, reward_threshold: float) -> dict:
+    """Per-batch local statistics -- the same per-batch quantities the old batch-concatenating
+    aggregate() computed in one pass, just scoped to a single SampleData so the caller can
+    discard it immediately afterward instead of accumulating every batch in memory."""
+    valid = np.asarray(data.valid)                 # [T, B]
+    obs = np.asarray(data.obs_errors)
+    reward = np.asarray(data.reward_errors)
+    terminal_err = np.asarray(data.terminal_errors)
+    legal = np.asarray(data.legal_errors)
+    next_terminal = np.asarray(data.next_terminal)
 
     # errors are already valid-masked to 0 on invalid steps, so thresholds never trip there
     # (and, being valid-masked, an erroneous step is necessarily a valid step). legal_errors
     # is further masked to 0 wherever next_terminal is True (no legal mask is defined for a
     # terminal state), so it never trips the threshold there either.
     erroneous_step = ((obs >= obs_threshold) | (reward > reward_threshold)
-                      | (terminal_err > 0) | (legal > 0))                                     # [T, total]
-    traj_erroneous = erroneous_step.any(axis=0)                                           # [total]
-    num_traj = int(valid.shape[1])
-    num_err_traj = int(traj_erroneous.sum())
-
-    total_valid_steps = int(valid.sum())
-    num_err_steps = int(erroneous_step.sum())
+                      | (terminal_err > 0) | (legal > 0))                                     # [T, B]
+    traj_erroneous = erroneous_step.any(axis=0)                                           # [B]
 
     # obs/reward/terminal are evaluated at every valid step, including the one transitioning
     # into a terminal state; legal is evaluated one step less (excluding that transition).
-    denom = float(valid[:, traj_erroneous].sum())
     legal_valid = valid * (1.0 - next_terminal.astype(np.float64))
-    legal_denom = float(legal_valid[:, traj_erroneous].sum())
-    if denom > 0:
-        per_category = {
-            "obs": float(obs[:, traj_erroneous].sum() / denom),
-            "reward": float(reward[:, traj_erroneous].sum() / denom),
-            "terminal": float(terminal_err[:, traj_erroneous].sum() / denom),
-            "legal": float(legal[:, traj_erroneous].sum() / legal_denom) if legal_denom > 0 else 0.0,
-        }
-    else:
-        per_category = {"obs": 0.0, "reward": 0.0, "terminal": 0.0, "legal": 0.0}
+    return dict(
+        num_traj=int(valid.shape[1]),
+        num_err_traj=int(traj_erroneous.sum()),
+        total_valid_steps=int(valid.sum()),
+        num_err_steps=int(erroneous_step.sum()),
+        denom=float(valid[:, traj_erroneous].sum()),
+        legal_denom=float(legal_valid[:, traj_erroneous].sum()),
+        obs_sum=float(obs[:, traj_erroneous].sum()),
+        reward_sum=float(reward[:, traj_erroneous].sum()),
+        terminal_sum=float(terminal_err[:, traj_erroneous].sum()),
+        legal_sum=float(legal[:, traj_erroneous].sum()),
+    )
 
-    return {
-        # Step-level fraction: does not saturate the way the trajectory fraction does for
-        # short games, so it is the more informative discriminator of rollout validity.
-        "fraction_erroneous_steps": num_err_steps / total_valid_steps if total_valid_steps else 0.0,
-        "num_erroneous_steps": num_err_steps,
-        "total_valid_steps": total_valid_steps,
-        # Trajectory-level fraction (>=1 erroneous step in the trajectory), kept for reference.
-        "fraction_erroneous_trajectories": num_err_traj / num_traj if num_traj else 0.0,
-        "num_erroneous_trajectories": num_err_traj,
-        "num_trajectories": num_traj,
-        "erroneous_trajectory_valid_steps": int(valid[:, traj_erroneous].sum()),
-        "erroneous_trajectory_legal_steps": int(legal_valid[:, traj_erroneous].sum()),
-        "per_category_error": per_category,
-        "obs_threshold": obs_threshold,
-        "reward_threshold": reward_threshold,
-    }
+
+class RunningRolloutStats:
+    """Merges a stream of per-batch compute_batch_stats() dicts into the same aggregate shape
+    the old all-batches-at-once aggregate() returned, via RunningAverage for every fraction/
+    mean-valued field (each with its own weight n: valid steps, trajectory count, or
+    erroneous-trajectory valid/legal steps -- these differ per field, so each gets its own
+    running (avg, n) pair rather than sharing one global step counter)."""
+    def __init__(self):
+        self.steps_avg = RunningAverage()      # fraction_erroneous_steps, n = total_valid_steps
+        self.traj_avg = RunningAverage()       # fraction_erroneous_trajectories, n = num_trajectories
+        self.obs_avg = RunningAverage()        # n = erroneous_trajectory_valid_steps
+        self.reward_avg = RunningAverage()     # n = erroneous_trajectory_valid_steps
+        self.terminal_avg = RunningAverage()   # n = erroneous_trajectory_valid_steps
+        self.legal_avg = RunningAverage()      # n = erroneous_trajectory_legal_steps
+        self.num_err_steps = 0
+        self.num_err_traj = 0
+
+    def update(self, stats: dict):
+        self.steps_avg.update(stats["num_err_steps"], stats["total_valid_steps"])
+        self.traj_avg.update(stats["num_err_traj"], stats["num_traj"])
+        self.obs_avg.update(stats["obs_sum"], stats["denom"])
+        self.reward_avg.update(stats["reward_sum"], stats["denom"])
+        self.terminal_avg.update(stats["terminal_sum"], stats["denom"])
+        self.legal_avg.update(stats["legal_sum"], stats["legal_denom"])
+        self.num_err_steps += stats["num_err_steps"]
+        self.num_err_traj += stats["num_err_traj"]
+
+    def result(self, obs_threshold: float, reward_threshold: float) -> dict:
+        return {
+            # Step-level fraction: does not saturate the way the trajectory fraction does for
+            # short games, so it is the more informative discriminator of rollout validity.
+            "fraction_erroneous_steps": self.steps_avg.avg,
+            "num_erroneous_steps": self.num_err_steps,
+            "total_valid_steps": self.steps_avg.n,
+            # Trajectory-level fraction (>=1 erroneous step in the trajectory), kept for reference.
+            "fraction_erroneous_trajectories": self.traj_avg.avg,
+            "num_erroneous_trajectories": self.num_err_traj,
+            "num_trajectories": self.traj_avg.n,
+            "erroneous_trajectory_valid_steps": int(self.obs_avg.n),
+            "erroneous_trajectory_legal_steps": int(self.legal_avg.n),
+            "per_category_error": {
+                "obs": self.obs_avg.avg,
+                "reward": self.reward_avg.avg,
+                "terminal": self.terminal_avg.avg,
+                "legal": self.legal_avg.avg,
+            },
+            "obs_threshold": obs_threshold,
+            "reward_threshold": reward_threshold,
+        }
 
 
 parser = ArgumentParser(description="Evaluate world-model imagined-rollout validity by sampling "
@@ -436,15 +527,17 @@ def run_for_model(model: DreamerMA, args) -> dict:
     if not sampler.check_encoder_compatible(ma_rssm):
         print("  Encoder architecture incompatible with this checkpoint -- falling back to "
               "prior + snapping for root grounding.")
+    obs_threshold = 1.0 - args.upper_bound
+    reward_threshold = args.reward_threshold
+    running = RunningRolloutStats()
     start_time = time.time()
-    batches = []
     for b in range(args.num_batches):
         data = sampler.imagine_trajectories(ma_rssm, sampler.get_next_key())
-        batches.append(jax.tree.map(np.asarray, data))
+        data = jax.tree.map(np.asarray, data)
+        running.update(compute_batch_stats(data, obs_threshold, reward_threshold))
         if args.verbose:
             print(f"  batch {b + 1}/{args.num_batches}, {time.time() - start_time:.1f}s")
-    result = aggregate(batches, obs_threshold=1.0 - args.upper_bound,
-                       reward_threshold=args.reward_threshold)
+    result = running.result(obs_threshold, reward_threshold)
     result["batch_size"] = args.batch_size
     result["num_batches"] = args.num_batches
     result["time_seconds"] = time.time() - start_time

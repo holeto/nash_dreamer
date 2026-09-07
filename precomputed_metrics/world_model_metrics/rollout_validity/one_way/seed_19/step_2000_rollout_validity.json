@@ -1,0 +1,23 @@
+{
+  "fraction_erroneous_steps": 0.43509343468621325,
+  "num_erroneous_steps": 19232,
+  "total_valid_steps": 44202,
+  "fraction_erroneous_trajectories": 0.7017735665694849,
+  "num_erroneous_trajectories": 5777,
+  "num_trajectories": 8232,
+  "erroneous_trajectory_valid_steps": 32175,
+  "erroneous_trajectory_legal_steps": 26398,
+  "per_category_error": {
+    "obs": 0.4942067838845182,
+    "reward": 0.026291446522769765,
+    "terminal": 0.0,
+    "legal": 0.0
+  },
+  "obs_threshold": 0.30000000000000004,
+  "reward_threshold": 0.2,
+  "batch_size": 2058,
+  "num_batches": 4,
+  "time_seconds": 15.441173315048218,
+  "seed": 19,
+  "step": 2000
+}

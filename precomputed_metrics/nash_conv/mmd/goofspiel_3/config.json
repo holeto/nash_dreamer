@@ -1,0 +1,31 @@
+{
+  "config": {
+    "report_gradnorms": false,
+    "num_epochs": 4,
+    "clip_epsilon": 0.2,
+    "kl_coeff": 0.1,
+    "magnet_coeff": 0.05,
+    "adv_norm_eps": 1e-08,
+    "gamma": 1.0,
+    "td_lambda": 0.95,
+    "actor_network_details": [
+      256,
+      1
+    ],
+    "critic_network_details": [
+      256,
+      1
+    ],
+    "bin_range": 20,
+    "target_network_update": 0.001
+  },
+  "buffer_config": {
+    "buffer_size": 64,
+    "sampling_epsilon": 0.0,
+    "replay_ratio": -1,
+    "return_log_frequency": 10,
+    "smoothing_window": 64,
+    "log_returns": true,
+    "number_of_negatives": 5
+  }
+}
