@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 
+# src/ layout: put it on PYTHONPATH (resolved from cwd, since this must be run from
+# the project root -- checkpoint/metric paths are also relative to the caller's cwd)
+# so `python -m <pkg>.<module>` resolves.
+export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # ------------------------------------------------------------------
 # USAGE INSTRUCTIONS
 # ------------------------------------------------------------------
 
 # Pass environment variables *before* the script command.
-# Assumption: You are already in the project folder and venv is active.
+# Assumption: You are already in the project folder. No manual venv activation
+# needed -- `uv run` resolves this project's own locked environment regardless of
+# what else is active in the shell.
 #
 # Example (Standard run):
 # ./rnad_train.sh
@@ -83,9 +90,9 @@ echo "Exp Flags:      $exp_flags"
 echo "Algorithm Flags: $ALGO_FLAGS"
 echo "Replay Flags:   $REPLAY_FLAGS"
 echo "Opt Flags:      $OPT_FLAGS"
-echo "Running         python -m experiments."$GAME"_train $GAME_FLAGS rnad $exp_flags --seeds $SEEDS \
+echo "Running         uv run python -m train."$GAME"_train $GAME_FLAGS rnad $exp_flags --seeds $SEEDS \
   $joint_ac_flags $OPT_FLAGS $REPLAY_FLAGS"
 echo "------------------------------------------------"
 
-python -m experiments."$GAME"_train $GAME_FLAGS rnad $exp_flags --seeds "$SEEDS" \
+uv run python -m train."$GAME"_train $GAME_FLAGS rnad $exp_flags --seeds "$SEEDS" \
   $joint_ac_flags $OPT_FLAGS $REPLAY_FLAGS

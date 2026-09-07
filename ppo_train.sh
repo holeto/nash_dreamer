@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+# src/ layout: put it on PYTHONPATH (resolved from cwd, since this must be run from
+# the project root -- checkpoint/metric paths are also relative to the caller's cwd)
+# so `python -m <pkg>.<module>` resolves.
+export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # ------------------------------------------------------------------
 # USAGE INSTRUCTIONS
 # ------------------------------------------------------------------
@@ -88,9 +93,9 @@ echo "Game Flags:     $GAME_FLAGS"
 echo "Exp Flags:      $exp_flags"
 echo "AC Flags:       $joint_ac_flags"
 echo "Opt Flags:      $OPT_FLAGS"
-echo "Running         python -m experiments."$GAME"_train $GAME_FLAGS ppo $exp_flags --seeds $SEEDS \
+echo "Running         uv run python -m train."$GAME"_train $GAME_FLAGS ppo $exp_flags --seeds $SEEDS \
   --opponent_path $OPPONENT --player_id $PLAYER_ID $joint_ac_flags $OPT_FLAGS $REPLAY_FLAGS"
 echo "------------------------------------------------"
 
-python -m experiments."$GAME"_train $GAME_FLAGS ppo $exp_flags --seeds "$SEEDS" \
+uv run python -m train."$GAME"_train $GAME_FLAGS ppo $exp_flags --seeds "$SEEDS" \
   --opponent_path "$OPPONENT" --player_id "$PLAYER_ID" $joint_ac_flags $OPT_FLAGS $REPLAY_FLAGS

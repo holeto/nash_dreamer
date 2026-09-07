@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 
+# src/ layout: put it on PYTHONPATH (resolved from cwd, since this must be run from
+# the project root -- checkpoint/metric paths are also relative to the caller's cwd)
+# so `python -m <pkg>.<module>` resolves.
+export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # ------------------------------------------------------------------
 # USAGE INSTRUCTIONS
 # ------------------------------------------------------------------
 
 # Pass environment variables *before* the script command.
-# Assumption: You are already in the project folder and venv is active.
+# Assumption: You are already in the project folder. No manual venv activation
+# needed -- `uv run` resolves this project's own locked environment regardless of
+# what else is active in the shell.
 #
 # Example (Standard run):
 # ./nash_dreamer_evaluate.sh
@@ -52,6 +59,6 @@ echo "------------------------------------------------"
 
 #The experiment type is always "loaded" with --restore_step -1,
 # since that ensures checking the whole folder for the metric.
-python -m experiments.actor_critic_evaluate --base_path "$BASE_PATH" --game_name "$GAME_NAME" \
+uv run python -m eval.actor_critic_evaluate --base_path "$BASE_PATH" --game_name "$GAME_NAME" \
 --seeds "$SEEDS" --restore_step "-1" --scale_factor "$scale_factor" loaded --metric "$METRIC" \
 --algo_dirs "$ALGO_DIRS"
