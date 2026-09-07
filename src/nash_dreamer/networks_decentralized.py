@@ -66,19 +66,18 @@ class DecSequenceModel(nnx.Module):
 
 class DecEncoder(nnx.Module):
   """Decentralized counterpart of networks.Encoder.
-  Receives one player's own observation together with that player's recurrent
-  state, and returns the latent feature vector used to produce its posterior
+  Receives one player's own observation and returns the latent feature vector
+  that, along with that player's recurrent state, produces its posterior
   stochastic state logits."""
-  def __init__(self, observation_features, recurrent_state_size, tokens_features,
+  def __init__(self, observation_features, tokens_features,
                hidden_features, num_layers, rngs: nnx.Rngs) -> None:
     self.tokens_features = tokens_features
-    self.init_layer = LinNormRelu(recurrent_state_size + observation_features, hidden_features, rngs)
+    self.init_layer = LinNormRelu(observation_features, hidden_features, rngs)
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
     self.last_layer = nnx.Linear(hidden_features, tokens_features, rngs=rngs)
 
-  def __call__(self, recurrent_state: chex.Array, observation: chex.Array):
-    x = jnp.concatenate([recurrent_state, observation], axis=-1)
-    x = self.init_layer(x)
+  def __call__(self, observation: chex.Array):
+    x = self.init_layer(observation)
     x = self.core_mlp(x)
     tokens = self.last_layer(x)
     return tokens
@@ -123,17 +122,3 @@ class DecLegalActionsNetwork(nnx.Module):
     x = self.core_mlp(x)
     return self.legal_layer(x)
 
-
-class DecEmbeddingCritic(nnx.Module):
-  """Decentralized counterpart of networks.EmbeddingCritic.
-  Scores one player's own encoder tokens against that player's own observation,
-  for the contrastive (InfoNCE) term of the world-model loss."""
-  def __init__(self, num_tokens: int, observation_features: int, rngs: nnx.Rngs):
-    self.W = nnx.Linear(observation_features, num_tokens, rngs=rngs)
-
-  def __call__(self, embedding: chex.Array, observation: chex.Array):
-    #Project the observation into the embedding space
-    # We want the embedding to contain positively
-    # correlated information with the observation
-    projected_obs = self.W(observation)
-    return jnp.sum(projected_obs * embedding, axis=-1)

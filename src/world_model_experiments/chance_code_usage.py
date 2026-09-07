@@ -10,14 +10,6 @@ every node (chance or deterministic): enumerate the posterior's --probability_ep
 categorical combos, decode each, and continue with whichever decodes closest (L-inf) to the
 real observation.
 
-IMPORTANT: the posterior is computed with the CLUSTER's Encoder/Observer wiring --
-tokens = enc(obs) (obs only), stochastic_state = observer(recurrent_state, tokens)
-(contextual on recurrent) -- the inverse of this repo's current get_encoder_no_jit
-(enc(recurrent_state, obs) then observer(tokens)). This is scoped to this script only (no
-change to networks.py/ma_rssm.py), so it only works correctly against checkpoints/code
-environments where that wiring is what was actually trained -- in general, run this under a
-cluster-matched code environment, not the current repo's networks.py/ma_rssm.py.
-
 Stores one aggregate JSON per (seed, step) -- not a per-node record list, since only the
 final histograms matter here. Counts are split the same way posterior_collapse_eval.py's
 data is later clustered for plotting: deterministic nodes get their own histogram, and
@@ -50,8 +42,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from nash_dreamer.dreamer_ma import DreamerMA, MARSSM
-from nash_dreamer.train_utils import parse_sequence, symlog
+from nash_dreamer.dreamer_ma import DreamerMA
+from nash_dreamer.train_utils import parse_sequence
 from eval.eval_utils import unroll_chance_node, cartesian_product
 from world_model_experiments.chance_marginal_eval import (
     load_checkpoint, discover_checkpoint_steps, _filter_stoch,
@@ -84,14 +76,6 @@ parser.add_argument("--output_dir", type=str, default=None,
                          "chance_code_usage.json. Defaults to saving directly inside each "
                          "seed's own model directory.")
 parser.add_argument("--verbose", action="store_true", help="Print progress.")
-
-
-def cluster_get_encoder(ma_rssm: MARSSM, recurrent_state, obs):
-    """Cluster wiring: encoder takes obs only, observer is contextual on recurrent_state --
-    the inverse of this repo's current get_encoder_no_jit. See module docstring."""
-    obs = obs if ma_rssm.obs_loss_bce else symlog(obs)
-    tokens = MARSSM.call_net(ma_rssm.enc, obs)
-    return MARSSM.call_net(ma_rssm.observer, recurrent_state, tokens)
 
 
 def combo_index(comb: np.ndarray, num_categories: int) -> int:
@@ -187,7 +171,7 @@ def run_for_model(model: DreamerMA, args) -> dict:
 
             following = []
             for i in range(num_valid):
-                posterior_i = cluster_get_encoder(ma_rssm, recurrent, target_obs[i])
+                posterior_i = ma_rssm.get_encoder_no_jit(recurrent, target_obs[i])
                 best_deter_i = evaluate_and_count(posterior_i, recurrent, target_obs[i], bucket)
                 if bool(out_term[i]):
                     continue
@@ -198,7 +182,7 @@ def run_for_model(model: DreamerMA, args) -> dict:
             return following
 
         target_obs = np.asarray(get_both_obs(child_state))  # [players, obs_dim]
-        posterior = cluster_get_encoder(ma_rssm, recurrent, target_obs)
+        posterior = ma_rssm.get_encoder_no_jit(recurrent, target_obs)
         best_deter = evaluate_and_count(posterior, recurrent, target_obs, deterministic_counts)
         if bool(child_terminal):
             return []

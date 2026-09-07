@@ -93,8 +93,8 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
     def call_net(net, *args):
       return net(*args)
     vectorized_seq = nnx.vmap(call_net, in_axes=(None, 0, 0, 0), out_axes=0)
-    vectorized_enc = nnx.vmap(call_net, in_axes=(None, 0, 0), out_axes=0)
-    vectorized_observer = nnx.vmap(call_net, in_axes=(None, 0), out_axes=0)
+    vectorized_enc = nnx.vmap(call_net, in_axes=(None, 0), out_axes=0)
+    vectorized_observer = nnx.vmap(call_net, in_axes=(None, 0, 0), out_axes=0)
 
     def sample_deter_per_player(stoch_logits, deter_key):
       """Each player samples independently: sample_categorical derives its
@@ -120,9 +120,6 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
       valid: bool
       recurrent_state: chex.Array  # [Player, recurrent_state_size]
       prev_action: chex.Array
-      prev_is_chance: chex.Array #Was the previous row a chance node?
-      pending_negative_obs: chex.Array #Flattened negative observations from the
-                                            # previous row's chance resolution
 
     init_carry = SampleTrajectoryCarry(
       game_state = game_state,
@@ -131,9 +128,7 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
       terminal = jnp.array(False),
       valid = jnp.array(True),
       recurrent_state = init_recur,
-      prev_action = dummy_action,
-      prev_is_chance = jnp.array(False),
-      pending_negative_obs = jnp.zeros((self.num_negatives, int(np.prod(self.example_timestep.obs.shape))))
+      prev_action = dummy_action
     )
 
     @nnx.jit
@@ -149,14 +144,6 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
     #per player vmap
     vectorized_get_actor = nnx.vmap(get_actor_policy, in_axes=(None, 0, 0), out_axes=0)
 
-    def encode_negative_outcome(game_state, outcome):
-      neg_state, _, _, _ = self.game.apply_action(game_state, outcome)
-      _, neg_p1_infoset, neg_p2_infoset, _ = self.game.get_info(neg_state)
-      neg_obs = jnp.stack((neg_p1_infoset, neg_p2_infoset), axis=0)
-      return neg_obs.reshape(-1)
-    #vmap over the negative outcomes; game_state is broadcast as a closure
-    vectorized_encode_negative = jax.vmap(encode_negative_outcome, in_axes=(None, 0), out_axes=0)
-
     @nnx.scan(in_axes=(nnx.Carry, None, None, None, None, 0), out_axes=(nnx.Carry, 0))
     def _sample_trajectory(carry: SampleTrajectoryCarry, recurrent_network: DecSequenceModel,
                            encoder_network: DecEncoder, observer_network: ObservedPredictor,
@@ -168,8 +155,8 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
       obs = jnp.stack((p1_infoset, p2_infoset), axis=0)
       enc_obs = symlog(obs) if not self.wm_config.obs_loss_bce else obs
       #Each player encodes only its own observation into its own posterior.
-      tokens = vectorized_enc(encoder_network, carry.recurrent_state, enc_obs)
-      encoded_stoch = vectorized_observer(observer_network, tokens)
+      tokens = vectorized_enc(encoder_network, enc_obs)
+      encoded_stoch = vectorized_observer(observer_network, carry.recurrent_state, tokens)
       encoded_deter = sample_deter_per_player(encoded_stoch, deter_sample_key)
       #No latent infoset is computed: with real infosets the actor reads the
       # game's own tensors, so nothing downstream would consume one.
@@ -183,54 +170,24 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
       is_chance = self.game.is_chance(carry.game_state)
       action_key = jax.random.split(action_key, num_players)
       action, action_oh = vectorized_sample_action(action_key, pi)
-      #Does not depend on the cond's outcome, so it can be computed here already
-      # and used to encode negatives meant for the *next* row.
       #Player i advances on action_oh[i] only.
       next_recur = vectorized_seq(recurrent_network, carry.recurrent_state, encoded_deter, action_oh)
       def apply_action():
-        next_state, terminal, reward, legal = self.game.apply_action(carry.game_state, action)
-        next_pending_negative_obs = jnp.zeros((self.num_negatives, obs.size), dtype=obs.dtype)
-        return next_state, terminal, reward, legal, next_pending_negative_obs
+        return self.game.apply_action(carry.game_state, action)
       def sample_chance():
         outcomes, probs = self.game.get_outcomes_and_probs(carry.game_state)
         # Do not forget for deterministic games to put nonzero probs
         # to sample something for shape consistency
         probs = jnp.where(is_chance, probs, jnp.ones_like(probs)/ probs.shape[0])
-        num_outcomes = outcomes.shape[0]
-
-        choice_key, negative_key = jax.random.split(chance_key, 2)
-        chosen_idx = jax.random.choice(choice_key, num_outcomes, p=probs)
-        chosen_outcome = outcomes[chosen_idx]
-
-        #Sample self.num_negatives outcomes with replacement, excluding the chosen
-        # outcome. Fall back to the unmasked distribution if it was the only
-        # outcome with nonzero probability.
-        neg_probs = probs * (1 - jax.nn.one_hot(chosen_idx, num_outcomes))
-        neg_probs_sum = jnp.sum(neg_probs)
-        neg_probs = jnp.where(neg_probs_sum > 0, neg_probs / (neg_probs_sum + (neg_probs_sum == 0)), probs)
-        neg_indices = jax.random.choice(negative_key, num_outcomes, shape=(self.num_negatives,), p=neg_probs, replace=True)
-        neg_outcomes = outcomes[neg_indices]
-
+        chosen_outcome = jax.random.choice(chance_key, outcomes, p=probs)
         outcome, terminal, reward, chosen_legals = self.game.apply_action(carry.game_state, chosen_outcome)
+        return outcome, terminal, reward, chosen_legals
 
-        next_pending_negative_obs = vectorized_encode_negative(carry.game_state, neg_outcomes)
-
-        return outcome, terminal, reward, chosen_legals, next_pending_negative_obs
-
-      next_game_state, next_terminal, next_rewards, next_legal, next_pending_negative_obs = jax.lax.cond(is_chance,
+      next_game_state, next_terminal, next_rewards, next_legal = jax.lax.cond(is_chance,
                                     sample_chance, apply_action)
-
-      #This row's own negatives: real ones handed down from a chance resolution
-      # at the previous row (now correctly conditioned on this row's
-      # or trivial repeats of this row's own obs if nothing preceded it.
-      own_negative_obs = jnp.where(
-          carry.prev_is_chance,
-          carry.pending_negative_obs,
-          jnp.zeros((self.num_negatives, obs.size), dtype=obs.dtype))
 
       timestep = TimeStep(
         obs = obs,
-        negative_obs = own_negative_obs,
         legal = carry.legal_actions.astype(u8),
         action = action_oh.astype(u8),
         policy = pi,
@@ -249,9 +206,7 @@ class DecentralizedWMReplayBuffer(WMReplayBuffer):
         terminal = next_terminal,
         valid = next_valid,
         recurrent_state = next_recur,
-        prev_action = action_oh,
-        prev_is_chance = is_chance,
-        pending_negative_obs = next_pending_negative_obs
+        prev_action = action_oh
       )
 
       timestep = tree_where(carry.valid, timestep, self.example_timestep)

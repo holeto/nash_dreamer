@@ -27,7 +27,7 @@ from functools import partial
 from nash_dreamer.networks import (ActorNetwork, CriticNetwork, DynamicsPredictor, ObservedPredictor,
                       RewardPredictor, DonePredictor)
 from nash_dreamer.networks_decentralized import (DecSequenceModel, DecEncoder, DecDecoder,
-                                    DecLegalActionsNetwork, DecEmbeddingCritic)
+                                    DecLegalActionsNetwork)
 from nash_dreamer.ma_rssm import MARSSM
 from nash_dreamer.optimizer import make_opt
 from nash_dreamer.distributions import sample_categorical
@@ -48,7 +48,6 @@ class DecentralizedPredictionStep():
   concat(recurrent_state, flat(deter_state)) per player."""
   recurrent_state: chex.Array       # [..., Player, rec_state_size]
   repr_state: chex.Array            # [..., Player, K, C] posterior logits
-  tokens: chex.Array                # [..., Player, encoder_tokens]
   deter_state: chex.Array           # [..., Player, K, C] sampled one-hot
   decoded_obs: chex.Array           # [..., Player, observation_size]
   reward_dist_logit: chex.Array     # [..., Player, 2 * bin_range + 1]
@@ -142,7 +141,6 @@ class DecentralizedMARSSM(nnx.Module):
                                  wm_config.dynamics_network_details[1],
                                  rngs=rngs)
     self.enc = DecEncoder(self.observation_size,
-                          rec_state_size,
                           enc_tokens,
                           wm_config.encoder_network_details[1],
                           wm_config.encoder_network_details[2],
@@ -154,18 +152,18 @@ class DecentralizedMARSSM(nnx.Module):
                           wm_config.decoder_network_details[0],
                           wm_config.decoder_network_details[1],
                           rngs)
-    self.observer = ObservedPredictor(enc_tokens,
+    self.observer = ObservedPredictor(rec_state_size,
+                                      enc_tokens,
                                       wm_config.encoded_classes,
                                       wm_config.encoded_categories,
                                       wm_config.observer_network_details[0],
                                       wm_config.observer_network_details[1],
                                       rngs)
-    self.embed_critic = DecEmbeddingCritic(enc_tokens, self.observation_size, rngs)
 
     #The last two entries must stay ('actor', 'critic'): DreamerMA slices [:-2]
     # for world-model gradient norms and the actor-critic learners slice [-2:].
     self.network_names = ['dyn', 'seq', 'enc', 'leg', 'observer', 'dec', 'rew', 'term',
-                          'embed_critic', 'actor', 'critic']
+                          'actor', 'critic']
 
     self.actor = ActorNetwork(self.infoset_size,
                               self.num_actions,
@@ -282,8 +280,8 @@ class DecentralizedMARSSM(nnx.Module):
   def get_encoder_no_jit(self, recurrent_state: chex.Array, obs: chex.Array, use_symlog=True):
     if not self.obs_loss_bce:
       obs = symlog(obs)
-    tokens = self._per_player(self.enc, recurrent_state, obs)
-    return self._per_player(self.observer, tokens)
+    tokens = self._per_player(self.enc, obs)
+    return self._per_player(self.observer, recurrent_state, tokens)
 
   @nnx.jit
   def get_next_recurrent(self, recurrent_state: chex.Array, deterministic_state: chex.Array, action: chex.Array):

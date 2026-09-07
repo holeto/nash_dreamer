@@ -85,7 +85,7 @@ class DreamerMA():
     #Also cache the sampling for the buffer
     self.buffer.cache_sampling(ma_rssm.seq, ma_rssm.enc, ma_rssm.observer, ma_rssm.infoset_network, ma_rssm.actor)
     self.grad_norms = {k: 0 for k in self.network_keys}
-    self.metrics = {'dec': 0, 'con': 0, 'leg': 0,  'rew': 0, 'dyn': 0, 'rep': 0,'is_act_dec': 0, 'is_obs_dec': 0, 'is_rec_pred': 0, 'is_deter_pred': 0, 'contrastive': 0}
+    self.metrics = {'dec': 0, 'con': 0, 'leg': 0,  'rew': 0, 'dyn': 0, 'rep': 0,'is_act_dec': 0, 'is_obs_dec': 0, 'is_rec_pred': 0, 'is_deter_pred': 0}
     if self.use_real_infoset:
       assert self.game.information_state_tensor_shape() == self.game.observation_tensor_shape(), "Specification of use_real_infoset is only sound when the environment provides infoset in place of observation!"
       print(f"Using original game infosets of shape {self.infoset_size}")
@@ -137,9 +137,7 @@ class DreamerMA():
         # at the current timestep. At first step, 
         # there was no previous action so we zero it out
         prev_action = jnp.where(timestep == 0, 0, prev_action)
-        enc_obs = symlog(obs) if not model.obs_loss_bce else obs
-        tokens = model.enc(recurrent_state, enc_obs)
-        stochastic_state = model.observer(tokens)
+        stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         deterministic_state = sample_categorical(stochastic_state, cur_key)
         prior_stochastic_state = model.get_dynamics_no_jit(recurrent_state)
@@ -156,7 +154,6 @@ class DreamerMA():
         preds = PredictionStepWithLegal(
                                 recurrent_state = recurrent_state,
                                 repr_state = stochastic_state,
-                                tokens = tokens,
                                 deter_state = deterministic_state,
                                 decoded_obs = decoded_obs,
                                 reward_dist_logit = reward,
@@ -228,31 +225,10 @@ class DreamerMA():
         repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
-      #Contrastive loss, we want to
-      # maximize the mutual information between the recurrent state/observation
-      # embedding and the observation.
-      #[Trajectory, Batch, obs_size * num_players]
-      flattened_obs = timestep.obs.reshape((*timestep.obs.shape[:-2], -1))
-      #[Trajectory, Batch, 1 + neg_samples, obs_size * num_players]
-      obs_with_negatives = jnp.concatenate((flattened_obs[..., None, :], timestep.negative_obs), axis=-2)
-      #Embeddings first, observations second
-      over_sample_similarity = nnx.vmap(MARSSM.call_net, in_axes=(None, None, 0), out_axes=0)
-      #Inner vmap over batch, outer over trajectory
-      vectorized_similarity = nnx.vmap(nnx.vmap(over_sample_similarity, in_axes=(None, 0, 0), out_axes=0), in_axes=(None, 0, 0), out_axes=0)
-      #[Trajectory, Batch, 1 + neg_samples]
-      similarity = vectorized_similarity(ma_rssm.embed_critic, predictions.tokens, obs_with_negatives)
-      #We want to maximize the similarity to the
-      #[Trajectory, Batch]
-      log_probs = jax.nn.log_softmax(similarity / self.wm_config.contrastive_temperature, axis=-1)
-      #Make sure to multiply by -1 to maximize the probability of the positive sample
-      contrastive_loss = -log_probs[..., 0]
-
-      con_neg = get_loss_mean_with_mask(contrastive_loss, timestep.valid)
-
       #Multiply the prediction losses with
       # the maximum information metric value, to prevent collapse
       # being the optimal solution.
-      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics / self.maximum_divergence, self.wm_config.beta_representation / self.maximum_divergence, *(self.wm_config.beta_infoset, ) * 4, self.wm_config.beta_contrastive]
+      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics / self.maximum_divergence, self.wm_config.beta_representation / self.maximum_divergence, *(self.wm_config.beta_infoset, ) * 4]
       l_infoset = 0
       #Update the latent infosets
       #The action loss predicts the previous action. Which also means we do not
@@ -288,7 +264,7 @@ class DreamerMA():
       l_infoset += is_deter
 
       
-      losses = [dec, con, leg, rew, l_dyn, l_rep, is_act, is_obs, is_rec, is_deter, con_neg]
+      losses = [dec, con, leg, rew, l_dyn, l_rep, is_act, is_obs, is_rec, is_deter]
 
       wm_keys = self.metrics.keys()
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}

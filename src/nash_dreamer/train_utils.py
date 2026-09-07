@@ -58,7 +58,6 @@ def track(func):
 class PredictionStepWithLegal():
   recurrent_state: chex.Array
   repr_state: chex.Array
-  tokens: chex.Array  # encoder output, shape (..., encoder_tokens_features)
   deter_state: chex.Array
   decoded_obs: chex.Array
   reward_dist_logit: chex.Array
@@ -93,7 +92,6 @@ class ActorCriticTimeStep():
 class TimeStep():
   
   obs: chex.Array = () # [..., Player, obs_dim]
-  negative_obs: chex.Array = () # [..., num_negatives, num_players * obs_features]
 
   legal: chex.Array = () # [..., Player, A] for multi agent or [..., A] for single_agent
   
@@ -118,8 +116,6 @@ class BufferConfig:
   return_log_frequency: int = 10
   smoothing_window: int = 50
   log_returns: bool = False
-  
-  number_of_negatives: int = 5 #Number of negative samples to use for the contrastive loss. If 0, no contrastive loss is used.
 
 @chex.dataclass(frozen=True)
 class RNaDConfig:
@@ -300,7 +296,6 @@ class DreamerMAConfig():
   beta_dynamics: float = 1
   beta_representation: float = 0.1
   beta_infoset: float = 1.0
-  beta_contrastive: float = 1.0
 
   #Distributional loss parameters
   jsd: bool =False #Whether to use JSD or KL for the prior/posterior distance
@@ -309,9 +304,6 @@ class DreamerMAConfig():
                               # commitment loss (cross entropy between the posterior and its
                               # own per-variable argmax), sharpening the posterior toward a
                               # deterministic code instead of pulling it toward the prior.
-  
-  #Contrastive loss parameters
-  contrastive_temperature: float = 0.1 #Temperature parameter for the contrastive loss.
 
   free_bits_clip_threshold: float = 1 #Threshold for loss clip in free bits.
   uniform_mix: float = 0.01 # Amount of uniform mixture added to the 

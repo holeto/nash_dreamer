@@ -82,7 +82,7 @@ class DecentralizedDreamerMA(DreamerMA):
     self.grad_norms = {k: 0 for k in self.network_keys}
     #Key order matters: it is zipped positionally against the `losses` list in
     # update_world_model. The four infoset terms are gone.
-    self.metrics = {'dec': 0, 'con': 0, 'leg': 0, 'rew': 0, 'dyn': 0, 'rep': 0, 'contrastive': 0}
+    self.metrics = {'dec': 0, 'con': 0, 'leg': 0, 'rew': 0, 'dyn': 0, 'rep': 0}
     assert self.game.information_state_tensor_shape() == self.game.observation_tensor_shape(), "Specification of use_real_infoset is only sound when the environment provides infoset in place of observation!"
     print(f"Decentralized world model. Using original game infosets of shape {self.infoset_size}, "
           f"per-player latent state of shape {self.latent_infoset_size}")
@@ -103,11 +103,10 @@ class DecentralizedDreamerMA(DreamerMA):
     """Compound loss for the entire decentralized world model.
 
     Every network is applied per player over a leading player axis, and each
-    player's chain is driven by its OWN observation and OWN action. Seven loss
+    player's chain is driven by its OWN observation and OWN action. Six loss
     terms remain; the four latent-infoset terms have no counterpart here."""
     sample_keys = jax.random.split(rng_key, self.non_chance_trajectory_max * self.wm_config.batch_size)
     sample_keys = sample_keys.reshape((self.non_chance_trajectory_max, self.wm_config.batch_size))
-    num_players = self.game.num_players()
 
     def world_model_loss(ma_rssm: DecentralizedMARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -122,11 +121,9 @@ class DecentralizedDreamerMA(DreamerMA):
 
         recurrent_state, timestep = carry
         action, obs, cur_key = xs
-        enc_obs = symlog(obs) if not model.obs_loss_bce else obs
-        #Each player encodes only its own observation, conditioned on its own
-        # recurrent state, into its own posterior.
-        tokens = per_player(model.enc, recurrent_state, enc_obs)
-        stochastic_state = per_player(model.observer, tokens)
+        #Each player encodes only its own observation into its own posterior,
+        # which its own recurrent state then contextualizes.
+        stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         #Independent sample per player -- see DecentralizedMARSSM._sample_deter
         # for why this must not be a single stacked sample_categorical call.
@@ -146,7 +143,6 @@ class DecentralizedDreamerMA(DreamerMA):
         preds = DecentralizedPredictionStep(
                                 recurrent_state = recurrent_state,
                                 repr_state = stochastic_state,
-                                tokens = tokens,
                                 deter_state = deterministic_state,
                                 decoded_obs = decoded_obs,
                                 reward_dist_logit = reward,
@@ -203,39 +199,14 @@ class DecentralizedDreamerMA(DreamerMA):
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold,
                            get_loss_mean_with_mask(repr_loss, timestep.valid[..., None], normalization_mult=2))
 
-      #Contrastive loss, we want to maximize the mutual information between each
-      # player's own encoder tokens and its own observation. The buffer stores
-      # negatives flattened over players, so they are reshaped back into a
-      # player axis and each player is scored against its own slice.
-      #[Trajectory, Batch, 1 + neg_samples, num_players, obs_size]
-      negatives = timestep.negative_obs.reshape((*timestep.negative_obs.shape[:-1],
-                                                 num_players, self.game.observation_tensor_shape()))
-      obs_with_negatives = jnp.concatenate((timestep.obs[..., None, :, :], negatives), axis=-3)
-      #Move the player axis in front of the sample axis so it can be the vmapped one
-      #[Trajectory, Batch, num_players, 1 + neg_samples, obs_size]
-      obs_with_negatives = jnp.swapaxes(obs_with_negatives, -2, -3)
-      #Embeddings first, observations second
-      over_sample_similarity = nnx.vmap(MARSSM.call_net, in_axes=(None, None, 0), out_axes=0)
-      over_player_similarity = nnx.vmap(over_sample_similarity, in_axes=(None, 0, 0), out_axes=0)
-      #Inner vmap over batch, outer over trajectory
-      vectorized_similarity = nnx.vmap(nnx.vmap(over_player_similarity, in_axes=(None, 0, 0), out_axes=0), in_axes=(None, 0, 0), out_axes=0)
-      #[Trajectory, Batch, num_players, 1 + neg_samples]
-      similarity = vectorized_similarity(ma_rssm.embed_critic, predictions.tokens, obs_with_negatives)
-      log_probs = jax.nn.log_softmax(similarity / self.wm_config.contrastive_temperature, axis=-1)
-      #Make sure to multiply by -1 to maximize the probability of the positive sample
-      contrastive_loss = -log_probs[..., 0]
-
-      con_neg = get_loss_mean_with_mask(contrastive_loss, timestep.valid[..., None], normalization_mult=2)
-
       #Multiply the prediction losses with
       # the maximum information metric value, to prevent collapse
       # being the optimal solution.
       mults = [*(self.wm_config.beta_prediction, ) * 4,
                self.wm_config.beta_dynamics / self.maximum_divergence,
-               self.wm_config.beta_representation / self.maximum_divergence,
-               self.wm_config.beta_contrastive]
+               self.wm_config.beta_representation / self.maximum_divergence]
 
-      losses = [dec, con, leg, rew, l_dyn, l_rep, con_neg]
+      losses = [dec, con, leg, rew, l_dyn, l_rep]
 
       wm_keys = self.metrics.keys()
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}

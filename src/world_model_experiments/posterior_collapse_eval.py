@@ -16,10 +16,9 @@ both distributions first, matching training's free-bits computation, so the two 
 share full support and the KL is well-defined.
 
 This test requires get_encoder_no_jit and therefore cannot run on checkpoints whose
-encoder has a different I/O contract than the current code (e.g. the old-architecture
-cluster checkpoints under world_model_metrics/metacentrum/models/) -- there is no
-meaningful fallback for a posterior-vs-prior test when the posterior can't be computed,
-so it will simply raise on such checkpoints.
+encoder has a different I/O contract than the current code -- there is no meaningful
+fallback for a posterior-vs-prior test when the posterior can't be computed, so it will
+simply raise on such checkpoints.
 
 Stores a pickle list with one record per chance node:
     {depth, history, reach_prob, gt_dist, kl_per_outcome, expected_kl, outcome_ids}.

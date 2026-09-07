@@ -72,31 +72,10 @@ class Sampler:
         # structurally identical imagine_trajectory scan.
         self.ac_trajectory_len = (ac_trajectory_len if ac_trajectory_len and ac_trajectory_len > 0
                                   else game.max_trajectory_lenght_no_chance() - 1)
-        self.encoder_compatible = None
 
     def get_next_key(self):
         immediate_key, self.key = jax.random.split(self.key)
         return immediate_key
-
-    def check_encoder_compatible(self, ma_rssm: MARSSM) -> bool:
-        """Detect once, eagerly (outside any jit/vmap trace), whether ma_rssm.get_encoder_no_jit
-        accepts this game's real (recurrent, obs) shapes. Some checkpoints predate a change to
-        the Encoder/ObservedPredictor I/O contract (recurrent_state moved from being an input to
-        ObservedPredictor to being an input to Encoder) -- a genuine architecture incompatibility,
-        not just a missing config field, that raises a shape-mismatch TypeError. Must be called
-        before the first call to imagine_trajectories, since that is jitted and the result is
-        baked into the trace as a static Python branch."""
-        if self.encoder_compatible is not None:
-            return self.encoder_compatible
-        try:
-            state, _ = self.game.initialize_structures()
-            _, p1_obs, p2_obs, _ = self.game.get_info(state)
-            obs = jnp.stack((p1_obs, p2_obs), axis=0)
-            ma_rssm.get_encoder_no_jit(ma_rssm.get_init_recurrent(), obs)
-            self.encoder_compatible = True
-        except Exception:
-            self.encoder_compatible = False
-        return self.encoder_compatible
 
     @partial(nnx.jit, static_argnums=0)
     def imagine_trajectories(self, model: MARSSM, key) -> SampleData:
@@ -132,44 +111,24 @@ class Sampler:
         init_state, init_legals = self.game.initialize_structures()
         init_recurrent = ma_rssm.get_init_recurrent()
 
-        if self.encoder_compatible:
-            # Posterior grounding: the real root chance node is resolved independently at
-            # random first, and the posterior faithfully encodes whatever real observation
-            # results -- self-consistent, since the posterior directly conditions on the one
-            # real, known observation (no snapping needed).
-            def get_init_chance():
-                outcomes, probs = self.game.get_outcomes_and_probs(init_state)
-                sampled_outcome = jax.random.choice(init_sample_key, outcomes, p=probs)
-                return self.game.apply_action(init_state, sampled_outcome)
+        # Posterior grounding: the real root chance node is resolved independently at
+        # random first, and the posterior faithfully encodes whatever real observation
+        # results -- self-consistent, since the posterior directly conditions on the one
+        # real, known observation (no snapping needed).
+        def get_init_chance():
+            outcomes, probs = self.game.get_outcomes_and_probs(init_state)
+            sampled_outcome = jax.random.choice(init_sample_key, outcomes, p=probs)
+            return self.game.apply_action(init_state, sampled_outcome)
 
-            def get_init_no_chance():
-                return init_state, jnp.array(False), jnp.array(0.0, dtype=jnp.float32), init_legals
+        def get_init_no_chance():
+            return init_state, jnp.array(False), jnp.array(0.0, dtype=jnp.float32), init_legals
 
-            start_state, start_terminal, start_reward, start_legals = jax.lax.cond(
-                self.game.is_chance(init_state), get_init_chance, get_init_no_chance)
-            start_obs = get_obs(start_state)
-            init_stoch = ma_rssm.get_encoder_no_jit(init_recurrent, start_obs)
-            init_deter = sample_categorical(init_stoch, init_latent_sample_key, self.sample_threshold)
-            model_root_obs = ma_rssm.get_decoder_no_jit(init_recurrent, init_deter, return_logits=False)
-        else:
-            # Encoder architecture incompatible with this checkpoint: fall back to the PRIOR,
-            # exactly like every other step of the rollout, and resolve the real root chance
-            # node via the SAME snapping the scan uses below -- never compare an independently/
-            # randomly chosen real outcome against the model's unrelated blind prior guess.
-            init_stoch = ma_rssm.get_dynamics_no_jit(init_recurrent)
-            init_deter = sample_categorical(init_stoch, init_latent_sample_key,
-                                            sample_threshold=ma_rssm.state_sample_threshold)
-            model_root_obs = ma_rssm.get_decoder_no_jit(init_recurrent, init_deter, return_logits=False)
-
-            def get_init_chance():
-                return snap_to_outcome(init_state, model_root_obs)
-
-            def get_init_no_chance():
-                return init_state, jnp.array(False), jnp.array(0.0, dtype=jnp.float32), init_legals
-
-            start_state, start_terminal, start_reward, start_legals = jax.lax.cond(
-                self.game.is_chance(init_state), get_init_chance, get_init_no_chance)
-            start_obs = get_obs(start_state)
+        start_state, start_terminal, start_reward, start_legals = jax.lax.cond(
+            self.game.is_chance(init_state), get_init_chance, get_init_no_chance)
+        start_obs = get_obs(start_state)
+        init_stoch = ma_rssm.get_encoder_no_jit(init_recurrent, start_obs)
+        init_deter = sample_categorical(init_stoch, init_latent_sample_key, self.sample_threshold)
+        model_root_obs = ma_rssm.get_decoder_no_jit(init_recurrent, init_deter, return_logits=False)
         # Seed the latent infoset by "observing" the real root observation, consistent with the
         # in-scan update (get_next_infoset_all from the previous infoset + obs + action).
         dummy_infoset = jnp.zeros((self.num_players, ma_rssm.latent_infoset_size))
@@ -524,9 +483,6 @@ def run_for_model(model: DreamerMA, args) -> dict:
                       sample_threshold=args.sample_threshold, sampling_epsilon=args.sampling_epsilon,
                       ac_trajectory_len=args.ac_trajectory_len)
     ma_rssm = model.optimizer.model
-    if not sampler.check_encoder_compatible(ma_rssm):
-        print("  Encoder architecture incompatible with this checkpoint -- falling back to "
-              "prior + snapping for root grounding.")
     obs_threshold = 1.0 - args.upper_bound
     reward_threshold = args.reward_threshold
     running = RunningRolloutStats()
