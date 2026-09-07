@@ -2,8 +2,8 @@
 policy, compare the world model's predicted (prior) next-observation distribution against
 the true one.
 
-Generalizes the Leduc-specific `decode_outcomes` in
-experiments/dreamer_leduc_endgame_evaluate.py to any JaxGame. The tree is walked following
+Generalizes the Leduc-specific `decode_outcomes` approach previously used for endgame
+evaluation to any JaxGame. The tree is walked following
 the model policy (actions below --policy_eps pruned and renormalized). At each transition
 the model prior dynamics(recurrent) is enumerated (filtered stochastic continuations), each
 continuation is decoded to an observation and snapped to the closest real reachable outcome

@@ -28,7 +28,7 @@ loaded_parser.add_argument("--metric_store_dir", type=str, default="metrics/", h
 loaded_parser.add_argument("--algo_dirs", type=str, default="NashDreamer=nash_dreamer_rnad RNaD=rnad NashDreamerREINFORCE=nash_dreamer_reinforce", help="Mapping of algorithm names to their directory names under base_path. Space-separated AlgoName=dir_name pairs. Example: 'NashDreamer=nash_dreamer_rnad RNaD=rnad_replayed'")
 
 nash_parser = experiment_parsers.add_parser(name="nash", help="Evaluate expected values of the model, best response values against it and also of a saved reference nash equilibrium strategy.")
-nash_parser.add_argument("--nash_strategy_path", type=str, default="experiments/goofspiel_nash.pkl", help="Path to the saved nash strategy in pickle format. Must be formatted as a tuple of behavioral strategies per tree depth and infoset map per tree_depth.")
+nash_parser.add_argument("--nash_strategy_path", type=str, default="src/eval/goofspiel_nash.pkl", help="Path to the saved nash strategy in pickle format. Must be formatted as a tuple of behavioral strategies per tree depth and infoset map per tree_depth.")
 
    
 def parse_env_returns(model_dir):

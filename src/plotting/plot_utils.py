@@ -78,7 +78,7 @@ def plot_mean_and_seeds(ax, per_seed_data: dict[int, tuple[np.ndarray, np.ndarra
                          color: str, label: str):
     """Draws one model's data on ax: a faint dashed line per seed, and a bold solid mean
     line on top (averaged per step over whichever seeds have data at that step -- seeds
-    need not share the exact same set of steps). Mirrors experiments/plot_metrics.py's
+    need not share the exact same set of steps). Mirrors plotting/plot_metrics.py's
     plot_comparison aggregation style."""
     if not per_seed_data:
         return

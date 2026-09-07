@@ -34,10 +34,9 @@ package) — `import train.goofspiel_train`, `import envs.jax_leduc`, etc. all r
 │   │   ├── jax_battleships.py     #   Battleships
 │   │   ├── jax_phantom_ttt.py     #   Phantom Tic-Tac-Toe
 │   │   ├── jax_rps.py             #   Rock-Paper-Scissors (and jax_rps_perturbed.py)
-│   │   ├── jax_strength_duel.py   #   Strength Duel
 │   │   ├── jax_point_card_matching.py # A toy single agent game environment
 │   │   └── model_game.py          #   Walks the real game and the latent world model together;
-│   │                               #   used to compute best responses/expected return in latent space
+│   │                               #   used to compute best responses/expected return in latent space. Only tractable for small games/models
 │   │
 │   ├── train/                 # Per-game entry points and the shared training loop
 │   │   ├── goofspiel_train.py, leduc_train.py, battleships_train.py, pcm_train.py,
@@ -45,6 +44,7 @@ package) — `import train.goofspiel_train`, `import envs.jax_leduc`, etc. all r
 │   │   ├── joint_train.py         #   Shared NashDreamer/RNaD/MMD/PPO training loop
 │   │   ├── joint_train_decentralized.py
 │   │   └── parsing_utils.py       #   Shared argument definitions
+│   │   (see src/train/README.md for details)
 │   │
 │   ├── eval/                  # Evaluation
 │   │   ├── actor_critic_evaluate.py   # NashConv / return evaluation
@@ -52,15 +52,15 @@ package) — `import train.goofspiel_train`, `import envs.jax_leduc`, etc. all r
 │   │   ├── policy_eval_utils.py       # Exact tree-walk NashConv/best-response (small games only)
 │   │   ├── ppo_exploitability.py      # Budgeted approximate exploitability via SimPPO
 │   │   └── pttt_exploitability/       # Exact Phantom TTT exploitability via the external `eas` solver
+│   │   (see src/eval/README.md for details)
 │   │
-│   ├── plotting/              # plot_metrics.py and the world-model plot scripts
-│   ├── world_model_experiments/   # World-model quality checks against a trained checkpoint
+│   ├── plotting/              # plot_metrics.py and the world-model plot scripts (src/plotting/README.md)
+│   ├── world_model_experiments/   # World-model quality checks against a trained checkpoint (src/world_model_experiments/README.md)
 │   ├── tests/                 # pytest suite (gitignored, machine-local)
-│   └── local_plotting/, debug/, tabular_experiments/  # Untracked scratch
+│   └── debug/, tabular_experiments/  # Scratch
 │
 ├── *_train.sh, *_evaluate.sh, ...  # Root-level launcher scripts (see below)
 ├── pyproject.toml, uv.lock         # Dependencies (see Requirements)
-└── trained_networks/, metrics/, ... # Generated output
 ```
 
 ## Requirements
@@ -128,136 +128,21 @@ GAME=goofspiel ALGO=reinforce OPT_FLAGS="--lr 0.001" SEEDS="(42,)" ./nash_dreame
 GAME=goofspiel EXPERIMENT_ADD_FLAGS="--continue_train" ./nash_dreamer_train.sh
 ```
 
-### Calling training scripts directly
-
-```bash
-export PYTHONPATH="$(pwd)/src"
-
-# NashDreamer on Goofspiel-3, single seed
-uv run python -m train.goofspiel_train nash_dreamer \
-  --num_steps 1000 --save_each 100 --print_each 100 \
-  --seeds "(42,)" --clean_dir --save_first \
-  --encoded_classes 1 --encoded_categories 3 \
-  --free_bits_threshold 1.0 --beta_representation 0.1 --batch_size 64 \
-  --beta_imagination 1.0 --beta_real 0.3 \
-  --buffer_size 64 --replay_ratio -1 --smoothing_window 64 --log_returns \
-  rnad --eta 0.2
-
-# RNaD baseline on Goofspiel-3, single seed
-uv run python -m train.goofspiel_train rnad \
-  --num_steps 1000 --save_each 100 --print_each 100 \
-  --seeds "(42,)" --clean_dir --save_first \
-  --eta 0.2 --sampling_epsilon 0.2 --rho_vtrace -1 \
-  --buffer_size 64 --replay_ratio -1 --smoothing_window 64 --log_returns
-
-# NashDreamer on Leduc Poker (larger latent space, longer training)
-uv run python -m train.leduc_train nash_dreamer \
-  --num_steps 10000 --save_each 1000 --print_each 1000 \
-  --seeds "(42,)" --clean_dir --save_first \
-  --encoded_classes 1 --encoded_categories 30 \
-  --free_bits_threshold 1.0 --beta_representation 0.1 --batch_size 64 \
-  --beta_imagination 1.0 --beta_real 0.3 \
-  --buffer_size 64 --replay_ratio -1 --log_returns \
-  rnad --eta 0.2
-```
-
-**Game-specific flags:**
-
-| Game | Flag | Description |
-|------|------|-------------|
-| PCM | `--num_cards N` | Number of cards (default: 3) |
-| PCM | `--stochastic` | Deal 1 card randomly, instead of descending |
-| PCM | `----chance_turn_before_terminal N` | How many turns before terminal node should the card be dealt randomly. Only for stochastic variant|
-| RPS | `--stochastic` | Use special stochastic RPS instead of standard. At the start a chance node will decide from one out of 3 perturbed variants uniformly. |
-| Goofspiel | `--num_cards N` | Number of cards (default: 3) |
-| Goofspiel | `--random` | Use random-order Goofspiel variant |
-| Goofspiel | `--obs_only` | Use only partial observation instead of infoset representation |
-| Leduc | `--one_round` | Single-round Leduc (no public card) |
-| Leduc | `--max_raises N` | Max raises per round (one-round only) |
-| Battleship | `--board_height R` | Number of rows on the board of each player |
-| Battleship | `--board_width C` | Number of columns on the board of each player |
-| Battleship | `--ship_sizes S1,S2,...,SN` | A comma separated string defining the tile sizes for N ships (minimum 1) |
-
-
-**Key training flags** (full list in `src/train/parsing_utils.py`):
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--num_steps` | — | Total training steps |
-| `--seeds` | `"(42, ...)"` | Tuple of RNG seeds to run |
-| `--batch_size` | 64 | Minibatch size |
-| `--encoded_classes` | 32 | Categorical distributions in the latent state |
-| `--encoded_categories` | 32 | Options per categorical distribution |
-| `--buffer_size` | 64 | Replay buffer capacity |
-| `--replay_ratio` | -1 | Off-policy reuse ratio (−1 = fully online) |
-| `--eta` (RNaD) | 0.2 | reward regularization strength |
-| `--beta_imagination` | 1.0 | Weight of imagined trajectory actor-critic loss |
-| `--beta_real` | 0.3 | Weight of real trajectory actor-critic loss |
+The standalone-baseline and PPO-best-response scripts (`rnad_train.sh`, `mmd_train.sh`,
+`ppo_train.sh`) follow the same `GAME=... VAR=... ./script.sh` pattern. See
+[src/train/README.md](src/train/README.md) for calling the training modules directly, the full
+per-game and per-algorithm flag reference, and other training-process details.
 
 ## Evaluation
 
-### NashConv and policy quality
+NashDreamer ships three evaluation protocols — see [src/eval/README.md](src/eval/README.md) for usage:
 
-Evaluates NashConv (`nash_conv`), expected utility (`expected_util`), or smoothed training returns (`env_return`) for one or more algorithms across seeds:
-
-```bash
-# Evaluate NashDreamer and RNaD on Goofspiel-3 at step 10 000 (default)
-./nash_dreamer_evaluate.sh
-
-# Evaluate on Leduc Poker, NashConv metric
-GAME_NAME="leduc" METRIC="nash_conv" SCALE_FACTOR=13 ./nash_dreamer_evaluate.sh
-
-# Or call directly:
-export PYTHONPATH="$(pwd)/src"
-uv run python -m eval.actor_critic_evaluate \
-  --base_path trained_networks \
-  --game_name goofspiel_3 \
-  --seeds "(42, 99, 160)" \
-  --restore_step 10000 \
-  loaded --metric nash_conv \
-  --algo_dirs "NashDreamer=nash_dreamer_rnad RNaD=rnad"
-```
-
-Pass `--restore_step -1` to evaluate all saved checkpoints in the directory.
-
-For Leduc Poker, set `--scale_factor 13` to match the reward scaling from -13 to 13.
-
-### Head-to-head evaluation
-
-Plays two trained policies against each other and records win rates:
-
-```bash
-# NashDreamer (P1) vs RNaD (P2) on Goofspiel-4 at step 10 000
-GAME_NAME="goofspiel_4" RESTORE_STEP=10000 ./head_to_head.sh
-
-# Custom algorithm pairing:
-GAME_NAME="goofspiel_3" \
-  ALGO_DIRS="NashDreamer=nash_dreamer_rnad NashDreamerREINFORCE=nash_dreamer_reinforce" \
-  ./head_to_head.sh
-
-# Or call directly:
-export PYTHONPATH="$(pwd)/src"
-uv run python -m eval.head_to_head_evaluate \
-  --base_path trained_networks \
-  --game_name goofspiel_4 \
-  --seeds "(42, 99, 160)" \
-  --restore_step_a 10000 \
-  --restore_step_b 10000 \
-  --algo_dirs "NashDreamer=nash_dreamer_rnad RNaD=rnad" \
-  --num_games 1024 \
-  --metric_store_dir metrics/
-```
-
-### Plotting
-
-```bash
-export PYTHONPATH="$(pwd)/src"
-uv run python -m plotting.plot_metrics        # NashConv / return curves
-```
-
-Head-to-head and Phantom TTT exploitability comparison plots (`plot_head_to_head.py`,
-`plot_pttt_exploitability.py`, ...) live under `src/local_plotting/` — untracked, one-off scripts, not
-a stable part of the pipeline.
+- **NashConv / policy quality** (`nash_dreamer_evaluate.sh`) — exact or best-response game-value
+  metrics for one or more trained algorithms across seeds.
+- **Head-to-head play** (`head_to_head.sh`) — win rates from playing two trained policies against
+  each other.
+- **Approximate PPO best response** (`ppo_exploitability.sh`) — a budgeted best-response search,
+  usable on games too large for the exact protocols above.
 
 ## Pre-computed Metrics
 

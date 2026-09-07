@@ -66,7 +66,7 @@ class MMDDreamer():
     #The imagined behaviour policy is pi_old. If the imagination mixes in uniform
     # exploration then it is not the policy of the actor itself, and the ratio is
     # no longer 1 at the first inner epoch. The buffer side of this check lives in
-    # experiments/joint_train.py, which is where the buffer config is in scope.
+    # train/joint_train.py, which is where the buffer config is in scope.
     if self.config.sampling_epsilon > 0:
       print(f"Warning! MMD is on-policy, but the imagination sampling_epsilon={self.config.sampling_epsilon} > 0. "
             f"The imagined behaviour policy is an epsilon-uniform mixture, so pi_old is not the policy of the "
