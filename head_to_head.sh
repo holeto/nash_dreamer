@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 
+# src/ layout: put it on PYTHONPATH (resolved from cwd, since this must be run from
+# the project root -- checkpoint/metric paths are also relative to the caller's cwd)
+# so `python -m <pkg>.<module>` resolves.
+export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # ------------------------------------------------------------------
 # USAGE INSTRUCTIONS
 # ------------------------------------------------------------------
 
 # Pass environment variables *before* the script command.
-# Assumption: You are already in the project folder and venv is active.
+# Assumption: You are already in the project folder. No manual venv activation
+# needed -- `uv run` resolves this project's own locked environment regardless of
+# what else is active in the shell.
 #
 # Example (Standard run):
 # ./head_to_head.sh
@@ -72,7 +79,7 @@ echo "Base path:        $BASE_PATH"
 echo "Metric store dir: $METRIC_STORE_DIR"
 echo "------------------------------------------------"
 
-python -m experiments.head_to_head_evaluate \
+uv run python -m eval.head_to_head_evaluate \
   --base_path "$BASE_PATH" \
   --game_name "$GAME_NAME" \
   --seeds "$SEEDS" \

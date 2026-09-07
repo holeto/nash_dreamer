@@ -208,9 +208,8 @@ marimo/_lsp/
 __marimo__/
 
 #Project specific folders that we do not want to include
-debug/
 plots/
-local_plotting/
+**/*/local_plotting/
 world_model_plots/
 tabular/
 cluster*/

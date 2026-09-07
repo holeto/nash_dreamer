@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 
+# src/ layout: put it on PYTHONPATH (resolved from cwd, since this must be run from
+# the project root -- checkpoint/metric paths are also relative to the caller's cwd)
+# so `python -m <pkg>.<module>` resolves.
+export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # ------------------------------------------------------------------
 # USAGE INSTRUCTIONS
 # ------------------------------------------------------------------
 
 # Pass environment variables *before* the script command.
-# Assumption: You are already in the project folder and venv is active.
+# Assumption: You are already in the project folder. No manual venv activation
+# needed -- `uv run` resolves this project's own locked environment regardless of
+# what else is active in the shell.
 #
 # Example (Standard run):
 # ./nash_dreamer_train.sh
@@ -97,9 +104,9 @@ echo "WM Flags:       $wm_flags"
 echo "AC Flags:       $joint_ac_flags"
 echo "Algorithm Flags: $ALGO_FLAGS"
 echo "Opt Flags:      $OPT_FLAGS"
-echo "Running         python -m experiments."$GAME"_train $GAME_FLAGS nash_dreamer $exp_flags --seeds $SEEDS \
+echo "Running         uv run python -m train."$GAME"_train $GAME_FLAGS nash_dreamer $exp_flags --seeds $SEEDS \
   $wm_flags $joint_ac_flags $OPT_FLAGS $ALGO $ALGO_FLAGS"
 echo "------------------------------------------------"
 
-python -m experiments."$GAME"_train $GAME_FLAGS nash_dreamer $exp_flags --seeds "$SEEDS" \
+uv run python -m train."$GAME"_train $GAME_FLAGS nash_dreamer $exp_flags --seeds "$SEEDS" \
   $wm_flags $joint_ac_flags $OPT_FLAGS "$ALGO" $ALGO_FLAGS
