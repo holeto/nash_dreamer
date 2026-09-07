@@ -297,14 +297,6 @@ class DreamerMAConfig():
   beta_representation: float = 0.1
   beta_infoset: float = 1.0
 
-  #Distributional loss parameters
-  jsd: bool =False #Whether to use JSD or KL for the prior/posterior distance
-  max_divergence_scaling: bool = False #Whether to scale the prior/posterior distance
-  l2_posterior: bool = False #If True, replace the representation loss with a VQ-VAE style
-                              # commitment loss (cross entropy between the posterior and its
-                              # own per-variable argmax), sharpening the posterior toward a
-                              # deterministic code instead of pulling it toward the prior.
-
   free_bits_clip_threshold: float = 1 #Threshold for loss clip in free bits.
   uniform_mix: float = 0.01 # Amount of uniform mixture added to the 
                             # network produced categoricals. 

@@ -91,22 +91,6 @@ class DreamerMA():
       print(f"Using original game infosets of shape {self.infoset_size}")
     else:
       print(f"Using latent infosets of shape {self.infoset_size}")
-    if not self.wm_config.max_divergence_scaling:
-      print(f"Scaling turned off")
-      self.maximum_divergence = 1
-    #For each of the scaling losses, 
-    # we multiply by 2, since the metric is computed in both directions
-    elif self.wm_config.jsd:
-      #Maximum value of the metric used for prior/posterior
-      # distance. For JSD it is log(n), where n is the number
-      # of outcomes
-      self.maximum_divergence = 2 * jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes)
-    else:
-      #For KL, we get additional dependence on the uniform mixture constant
-      # this is an upper bound, that assumes the posterior does not get the uniform mixture
-      self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
-
-    print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
     
   
   def generate_key(self):
@@ -210,25 +194,13 @@ class DreamerMA():
       posterior = nnx.softmax(predictions.repr_state, axis=-1)
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch]
-      metric = jsd if self.wm_config.jsd else kl_divergence
-      dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
+      dynamics_loss = kl_divergence(jax.lax.stop_gradient(posterior), prior)
       l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
       #[Trajectory, Batch]
-      if self.wm_config.l2_posterior:
-        # VQ-VAE style commitment loss: instead of pulling the posterior toward the prior,
-        # sharpen it toward its own per-variable argmax (a stop-gradient one-hot target) --
-        # cross entropy between the posterior and that target, independent of the prior.
-        argmax_target = jax.lax.stop_gradient(
-            jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
-        repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
-      else:
-        repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+      repr_loss = kl_divergence(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
-      #Multiply the prediction losses with
-      # the maximum information metric value, to prevent collapse
-      # being the optimal solution.
-      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics / self.maximum_divergence, self.wm_config.beta_representation / self.maximum_divergence, *(self.wm_config.beta_infoset, ) * 4]
+      mults = [*(self.wm_config.beta_prediction, ) * 4, self.wm_config.beta_dynamics, self.wm_config.beta_representation, *(self.wm_config.beta_infoset, ) * 4]
       l_infoset = 0
       #Update the latent infosets
       #The action loss predicts the previous action. Which also means we do not

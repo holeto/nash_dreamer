@@ -40,10 +40,6 @@ def train_nash_dreamer(args, game: JaxGame):
       encoded_categories = args.encoded_categories,
       bin_range = args.wm_bin_range,
 
-      jsd=args.jsd,
-      max_divergence_scaling = args.max_divergence_scaling,
-      l2_posterior = args.l2_posterior,
-
       # Ordered as (hidden_layer_features, num_hidden_layers)
       sequential_network_details = (args.recurrent_state_size, args.sequential_mlp_features, args.sequential_mlp_layers),
       encoder_network_details = (args.encoder_tokens,args.encoder_hidden_features, args.encoder_hidden_layers),

@@ -86,17 +86,6 @@ class DecentralizedDreamerMA(DreamerMA):
     assert self.game.information_state_tensor_shape() == self.game.observation_tensor_shape(), "Specification of use_real_infoset is only sound when the environment provides infoset in place of observation!"
     print(f"Decentralized world model. Using original game infosets of shape {self.infoset_size}, "
           f"per-player latent state of shape {self.latent_infoset_size}")
-    if not self.wm_config.max_divergence_scaling:
-      print(f"Scaling turned off")
-      self.maximum_divergence = 1
-    #For each of the scaling losses,
-    # we multiply by 2, since the metric is computed in both directions
-    elif self.wm_config.jsd:
-      self.maximum_divergence = 2 * jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes)
-    else:
-      self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
-
-    print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
 
   @partial(nnx.jit, static_argnums=(0))
   def update_world_model(self, optimizer: nnx.Optimizer, timestep: TimeStep, rng_key):
@@ -191,20 +180,16 @@ class DecentralizedDreamerMA(DreamerMA):
       posterior = nnx.softmax(predictions.repr_state, axis=-1)
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch, num_players]
-      metric = jsd if self.wm_config.jsd else kl_divergence
-      dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
+      dynamics_loss = kl_divergence(jax.lax.stop_gradient(posterior), prior)
       l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold,
                            get_loss_mean_with_mask(dynamics_loss, timestep.valid[..., None], normalization_mult=2))
-      repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+      repr_loss = kl_divergence(posterior, jax.lax.stop_gradient(prior))
       l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold,
                            get_loss_mean_with_mask(repr_loss, timestep.valid[..., None], normalization_mult=2))
 
-      #Multiply the prediction losses with
-      # the maximum information metric value, to prevent collapse
-      # being the optimal solution.
       mults = [*(self.wm_config.beta_prediction, ) * 4,
-               self.wm_config.beta_dynamics / self.maximum_divergence,
-               self.wm_config.beta_representation / self.maximum_divergence]
+               self.wm_config.beta_dynamics,
+               self.wm_config.beta_representation]
 
       losses = [dec, con, leg, rew, l_dyn, l_rep]
 

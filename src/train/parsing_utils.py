@@ -53,11 +53,6 @@ def add_wm_arguments(parser: ArgumentParser) ->ArgumentParser:
   parser.add_argument("--uniform_mix", type=float, default=0.01, help="Amount of uniform mixed with the network returned categoricals.")
   parser.add_argument("--obs_loss_l2", action="store_true", default=False, help="Use L2 (symlog) loss for observation reconstruction instead of BCE.")
 
-  ##Distribution loss parameters
-  parser.add_argument("--jsd", action="store_true", default=False, help="Use Jensen-Shannon divergence for the dynamics and representation losses instead of KL-divergence.")
-  parser.add_argument("--max_divergence_scaling", action="store_true", default=False, help="Scale the dynamics and representation losses by the maximum value of the prior/posterior loss.")
-  parser.add_argument("--l2_posterior", action="store_true", default=False, help="Replace the representation loss with a VQ-VAE style commitment loss: cross entropy between the posterior and its own per-variable argmax (stop-gradient one-hot), sharpening the posterior toward a deterministic code instead of pulling it toward the prior.")
-
   ##Network layer parameters
   parser.add_argument("--sequential_mlp_features", type=int, default=256, help="Number of hidden features in the sequential network MLP.")
   parser.add_argument("--encoder_hidden_features", type=int, default=256, help="Size of the hidden layer in the encoder network")
