@@ -112,43 +112,173 @@ class DreamerMA():
     self.init_stage_one()
     self.check_two_stage()
 
+  def uses_two_stage(self):
+    """True when any of the three two stage variants is in effect.
+
+    The three differ only in how much they freeze, never in whether stage one exists, so
+    every site that asks "is this a two stage run" goes through here rather than repeating
+    the disjunction and risking one copy being missed when a variant is added."""
+    return (self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+            or self.wm_config.complete_two_stage)
+
+  def stage_one_freezes_actor_critic(self):
+    """True when stage one skips the actor-critic update outright, rather than training it
+    on real trajectories. --complete_two_stage inherits its stage one from --hard_two_stage
+    unchanged and differs only in what stage two freezes."""
+    return self.wm_config.hard_two_stage or self.wm_config.complete_two_stage
+
+  def frozen_network_names(self):
+    """The world model networks that must not move in stage two, for whichever two stage
+    variant is in effect. Empty for a run with no two stage flag; it does NOT depend on the
+    current phase, train_step is what only applies it once stage one is over.
+
+    Soft and hard freeze the POSTERIOR, which is exactly the encoder and the observer --
+    get_encoder_no_jit is enc -> observer and nothing else. --complete_two_stage freezes
+    every world model network except the prior; that set is derived from network_keys
+    rather than listed, so the decentralized model, which has no infoset networks, gets the
+    right one with nothing to keep in sync. The actor and critic are excluded either way,
+    network_keys already drops them."""
+    if self.wm_config.complete_two_stage:
+      return [k for k in self.network_keys if k != 'dyn']
+    if self.uses_two_stage():
+      return ['enc', 'observer']
+    return []
+
+  def snapshot_frozen_networks(self):
+    """Read the frozen networks' parameters, to be written back after the updates.
+
+    A zero gradient is NOT enough to freeze a network here, which is why the stop_gradients
+    in update_world_model do not finish the job on their own. DreamerMA.optimizer is a
+    single optimizer shared by the world model update and the actor-critic update, and
+    LaProp carries momentum across both, so a network that stops receiving gradient still
+    gets a geometrically decaying update from the momentum left over from when it last
+    learned. Measured on goofspiel_3 that tail is about 2.5e-5 in max |dw| over the ten
+    steps after the boundary and dies off as 3e-6, 2e-7, 7e-10 -- small, but not frozen.
+    This extracts the current arrays without copying them, the same way nnx.split does; the
+    restore below rebinds them, exactly what optimizer.update does, so neither costs any
+    device work."""
+    model = self.optimizer.model
+    return [(getattr(model, k), nnx.state(getattr(model, k), nnx.Param))
+            for k in self.frozen_network_names()]
+
+  def restore_frozen_networks(self, snapshot):
+    """Undo whatever the shared optimizer's momentum did to the frozen networks.
+
+    Load bearing for --soft_two_stage/--hard_two_stage, which keep the optimizer state they
+    have across the boundary. Under --complete_two_stage reset_optimizer_moments below has
+    already removed the momentum this undoes, so there it is a guarantee that does not depend
+    on reasoning about optax internals rather than the mechanism."""
+    for network, state in snapshot:
+      nnx.update(network, state)
+
+  def reset_optimizer_moments(self):
+    """Restart the optimizer's moment estimates, so stage two trains from a clean optimizer.
+
+    Called once, at the stage one boundary, and only under --complete_two_stage.
+
+    The motivating problem is the prior. dyn receives exactly zero gradient throughout stage
+    one and starts at zero, so its nu and mu are still at their init values when stage one
+    ends -- but the bias correction divisor is not, since nu_hat = nu / (1 - beta2**step) and
+    step has been counting all along. The first real dynamics gradient is therefore normalized
+    by an nu built from a single sample against a divisor that assumes thousands of them,
+    which overshoots by up to sqrt(1 / (1 - beta2)) = 31.6x and stays mis-scaled for roughly
+    1 / (1 - beta2) = 1000 steps while nu re-warms. That is the error in the rms NORMALIZATION;
+    the realized parameter movement is smaller, since momentum contributes only (1 - beta1) of
+    it on the first step and AGC clips the gradient beforehand. Measured on goofspiel_3 with a
+    3000 step stage one, dyn's actual per step movement over the first eight stage two steps is
+    4.0x to 8.8x larger without this reset than with it, peaking around step five.
+
+    Those step counters are single scalars shared by every parameter (see make_opt in
+    optimizer.py), so this cannot be done for dyn alone: resetting the counter while leaving
+    the other networks' warm nu in place would crush THEIR updates by the same factor in
+    reverse. Moments and counters have to go together, which is why this is gated to
+    --complete_two_stage -- there every other world model network is frozen from here on and
+    the actor-critic has never stepped, a complete stage one skipping it entirely, so their
+    moments are either irrelevant or still at init and nothing useful is discarded. Under
+    --soft_two_stage/--hard_two_stage networks keep training across the boundary with
+    unchanged objectives, so there is no free version of this and they keep what they have.
+
+    Two things are deliberately NOT reset:
+      - the learning rate schedule's own count, which has to keep tracking total updates.
+        Note it does not advance once per learner step: optimizer.update is called once by
+        the world model, once by the actor-critic's real loss and once more by its
+        imagination loss, so it runs at 1x during a complete stage one, 2x during the warm-up
+        and 3x after it. Restarting it would replay the OptimizerConfig.warmup ramp (1000 by
+        default) from a learning rate of zero, and would restart a linear/cosine anneal.
+      - nnx.Optimizer.step, which nothing in either tree reads and which would then disagree
+        with that count.
+
+    Every moment leaf inits to a plain zero (make_opt's transforms use zeros_like and a zero
+    step), so this zeroes the live Variables in place instead of building a fresh state and
+    swapping it in. Keeping the same Variable objects leaves the graphdef nnx.jit traced
+    against unchanged, so it costs no retrace."""
+    opt_state = self.optimizer.opt_state
+    #Fail loudly rather than silently zeroing the wrong transform if that chain ever changes.
+    assert (len(opt_state) == 4 and opt_state[0] == ()
+            and all(len(opt_state[i]) == 2 for i in (1, 2))
+            and hasattr(opt_state[3], 'count')), (
+      "reset_optimizer_moments expects the optax chain make_opt() builds in optimizer.py: "
+      "_clip_by_agc (stateless), _scale_by_rms (step, nu), _scale_by_momentum (step, mu), "
+      f"then scale_by_learning_rate (count). Got {[type(e).__name__ for e in opt_state]}.")
+    for step_variable, moments in (opt_state[1], opt_state[2]):
+      step_variable.value = jnp.zeros_like(step_variable.value)
+      for _, moment in nnx.to_flat_state(moments):
+        moment.value = jnp.zeros_like(moment.value)
+
   def init_stage_one(self):
     """Set up the stage one latch and its rolling window of world model losses.
 
     Stage one only exists when a two stage flag is given. Without one the run starts
     already past it, with stage_one_end_step 0, so the warm-up below counts from step 0
     exactly as it always did."""
-    self.stage_one_active = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    self.stage_one_active = self.uses_two_stage()
     #The learner step at which stage one ended. -1 while it is still running.
     self.stage_one_end_step = -1 if self.stage_one_active else 0
     self.stage_one_losses = deque(maxlen=self.wm_config.loss_check_window)
 
   def check_two_stage(self):
     """Validate the two stage warm-up flags and report which stage the run starts in."""
-    assert not (self.wm_config.soft_two_stage and self.wm_config.hard_two_stage), (
-      "--soft_two_stage and --hard_two_stage are two variants of the same warm-up and "
-      "cannot be combined. The hard one differs only in also skipping the actor-critic "
-      "update while the warm-up runs.")
-    if not (self.wm_config.soft_two_stage or self.wm_config.hard_two_stage):
+    given = [n for n, v in (("--soft_two_stage", self.wm_config.soft_two_stage),
+                            ("--hard_two_stage", self.wm_config.hard_two_stage),
+                            ("--complete_two_stage", self.wm_config.complete_two_stage)) if v]
+    assert len(given) <= 1, (
+      f"{' and '.join(given)} are variants of the same two stage schedule and cannot be "
+      f"combined. They are ordered by how much they freeze: soft freezes nothing beyond the "
+      f"dynamics loss during stage one, hard also freezes the actor-critic during stage one, "
+      f"and complete additionally freezes the whole world model except the prior during "
+      f"stage two.")
+    if not given:
       return
     assert self.wm_config.loss_check_window > 1, (
       f"--loss_check_window is {self.wm_config.loss_check_window}, but a line cannot be "
       f"fitted to fewer than two points. Supply a window of at least 2, and realistically "
       f"a few tens of steps for the fit to mean anything.")
-    stage = "hard" if self.wm_config.hard_two_stage else "soft"
+    stage = given[0][2:-10]
     kept = ("the VQ-VAE commitment loss" if self.wm_config.vq_vae_posterior
             else "no representation loss")
     frozen = ("the actor-critic is frozen"
-              if self.wm_config.hard_two_stage
+              if self.stage_one_freezes_actor_critic()
               else "the actor-critic keeps training on real trajectories")
     cap = (f", or after at most {self.wm_config.stage_one_max_steps} steps"
            if self.wm_config.stage_one_max_steps > 0 else "")
     #After stage one the posterior is frozen, so whichever representation term was running
     # stops. Say so explicitly: a reader watching `rep` drop to 0 at the boundary should not
     # have to guess whether that is intentional.
-    after = ("the VQ-VAE commitment loss stops with it and the posterior is frozen"
-             if self.wm_config.vq_vae_posterior
-             else "the posterior is frozen, so no representation loss ever runs")
+    if self.wm_config.complete_two_stage:
+      #Say plainly that the reported losses stop meaning anything about learning, since
+      # every one of them except dyn keeps being printed while training nothing.
+      after = ("the ENTIRE world model is frozen except the prior: the encoder, observer, "
+               "sequential network, decoder, the reward/done/legal heads and all three "
+               "infoset networks stop learning, and only the dynamics network and the "
+               "actor-critic keep training. Every other loss is still computed and printed "
+               "but no longer trains anything, so watch them for drift rather than progress. "
+               "The optimizer's moment estimates are reset at the boundary, so the prior "
+               "starts from a clean optimizer rather than one whose bias correction has been "
+               "counting through a stage in which it received no gradient")
+    elif self.wm_config.vq_vae_posterior:
+      after = "the VQ-VAE commitment loss stops with it and the posterior is frozen"
+    else:
+      after = "the posterior is frozen, so no representation loss ever runs"
     print(f"Using {stage} two stage training. Stage one: the world model trains on the "
           f"reconstruction and infoset losses with {kept} and no dynamics loss, and "
           f"{frozen}. It ends once the world model loss has plateaued over a window of "
@@ -189,10 +319,16 @@ class DreamerMA():
     self.stage_one_active = False
     self.stage_one_end_step = self.learner_steps
     self.stage_one_losses.clear()
+    reset_note = ""
+    if self.wm_config.complete_two_stage:
+      self.reset_optimizer_moments()
+      reset_note = (" The optimizer's moment estimates and their bias correction counters "
+                    "were reset, so the prior trains from a clean optimizer state; the "
+                    "learning rate schedule is untouched.")
     print(f"Stage one ended at step {self.stage_one_end_step} because {reason}. The world "
           f"model now trains on its full loss; imagination starts after a further "
           f"{self.ac_config.wm_warm_up_period} warm-up steps, at step "
-          f"{self.stage_one_end_step + self.ac_config.wm_warm_up_period}.")
+          f"{self.stage_one_end_step + self.ac_config.wm_warm_up_period}.{reset_note}")
 
   def imagination_start_step(self):
     """The learner step at which imagination starts, or -1 while stage one is unfinished.
@@ -231,8 +367,11 @@ class DreamerMA():
     # and the recurrent chain flows back through the sampled state into the observer and the
     # encoder. Cutting it at the Encoder/Observer output is what actually freezes them.
     # Static, like two_stage_warm_up, so this is a compile time branch.
-    two_stage = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    two_stage = self.uses_two_stage()
     freeze_posterior = two_stage and not two_stage_warm_up
+    #--complete_two_stage freezes the rest of the world model on top of that: in stage two
+    # the dynamics network is the only part of it still learning. Also static.
+    freeze_world_model = self.wm_config.complete_two_stage and not two_stage_warm_up
     
     def world_model_loss(ma_rssm: MARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -255,7 +394,11 @@ class DreamerMA():
           stochastic_state = jax.lax.stop_gradient(stochastic_state)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         deterministic_state = sample_categorical(stochastic_state, cur_key)
-        prior_stochastic_state = model.get_dynamics_no_jit(recurrent_state)
+        #With the world model frozen the dynamics network is the only one left to train, so
+        # its input must be cut too -- otherwise the dynamics loss would keep training the
+        # sequential network that produced recurrent_state, and through it everything upstream.
+        dynamics_input = jax.lax.stop_gradient(recurrent_state) if freeze_world_model else recurrent_state
+        prior_stochastic_state = model.get_dynamics_no_jit(dynamics_input)
         prior_stochastic_state = add_uniform_mix(prior_stochastic_state, self.wm_config.uniform_mix)
         decoded_obs = model.get_decoder_no_jit(recurrent_state, deterministic_state, return_logits=True)
         reward, done = model.rew(recurrent_state, deterministic_state), model.term(recurrent_state, deterministic_state)
@@ -399,8 +542,20 @@ class DreamerMA():
 
       wm_keys = self.metrics.keys()
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}
-      
-      compound_loss = sum(l * m for l, m in zip(losses, mults))
+
+      if freeze_world_model:
+        #--complete_two_stage, stage two: every term but the dynamics loss is detached, so
+        # the networks it would otherwise train get an exactly zero gradient instead of a
+        # small one. The terms are still computed -- the forward pass is needed for the
+        # prediction step the actor-critic consumes anyway -- and still reported, and since
+        # stop_gradient is the identity forward the printed compound loss is numerically
+        # unchanged and stays comparable across the stage one boundary.
+        grad_losses = [l if k == 'dyn' else jax.lax.stop_gradient(l)
+                       for k, l in zip(wm_keys, losses)]
+      else:
+        grad_losses = losses
+
+      compound_loss = sum(l * m for l, m in zip(grad_losses, mults))
       
       #jax.debug.breakpoint(num_frames=2)
 
@@ -424,8 +579,8 @@ class DreamerMA():
     #Three sequential phases, and stage one is orthogonal to the warm-up rather than sharing
     # its budget:
     #  1. stage one -- the world model drops its dynamics loss (and, unless vq_vae_posterior
-    #     is set, its representation loss), and a hard stage one freezes the actor-critic
-    #     entirely. Ends dynamically, when the world model loss plateaus.
+    #     is set, its representation loss), and a hard or complete stage one freezes the
+    #     actor-critic entirely. Ends dynamically, when the world model loss plateaus.
     #  2. warm-up -- wm_warm_up_period steps on the FULL world model loss, actor-critic
     #     training on real trajectories only, imagination still off.
     #  3. everything on.
@@ -442,10 +597,19 @@ class DreamerMA():
     buffer_key = self.generate_key()
     timestep = self.buffer.mixed_sample(buffer_key)
     wm_key = self.generate_key()
+    #Stage two of any two stage variant: the stop_gradients in update_world_model already
+    # give the frozen networks an exactly zero gradient, but both updates below run through
+    # one shared optimizer whose leftover momentum would still nudge them. Snapshot around
+    # the pair and write them back. Which networks those are depends on the variant --
+    # posterior only for soft and hard, everything but the prior for complete.
+    frozen = (self.snapshot_frozen_networks()
+              if self.uses_two_stage() and not in_stage_one else None)
     wm_loss, pred_step, self.wm_metrics, self.grad_norms = self.update_world_model(self.optimizer, timestep, wm_key, in_stage_one)
-    if not (self.wm_config.hard_two_stage and in_stage_one):
+    if not (self.stage_one_freezes_actor_critic() and in_stage_one):
       ac_key = self.generate_key()
       self.actor_critic.step(timestep, pred_step, ac_key, should_imagine)
+    if frozen is not None:
+      self.restore_frozen_networks(frozen)
     self.learner_steps += 1
     if in_stage_one:
       self.update_stage_one(wm_loss)

@@ -192,13 +192,21 @@ warm-up** — it runs first and ends dynamically, and only when it is over does 
 
 | phase | ends when | world-model loss | actor-critic | imagination |
 |---|---|---|---|---|
-| 1. stage one | the WM loss plateaus (dynamic) | recon + infoset, `rep` only if `--vq_vae_posterior`, no `dyn` | soft: trains on real / hard: frozen | off |
-| 2. warm-up | `--wm_warm_up` steps after phase 1 | recon + infoset + `dyn`; **no `rep` ever** | trains on real | off |
+| 1. stage one | the WM loss plateaus (dynamic) | recon + infoset, `rep` only if `--vq_vae_posterior`, no `dyn` | soft: trains on real / hard and complete: frozen | off |
+| 2. warm-up | `--wm_warm_up` steps after phase 1 | recon + infoset + `dyn`; **no `rep` ever**. Under complete, only `dyn` *trains* | trains on real | off |
 | 3. full | — | same as phase 2 | trains | on |
 
-**Without `--soft_two_stage`/`--hard_two_stage` phase 1 is empty**, `stage_one_end_step` is 0, the
-warm-up counts from step 0, and none of the freeze below applies — exactly the original behaviour,
-where `--wm_warm_up` (default 1000) gated imagination alone and both `dyn` and `rep` ran from step 0.
+**Without a two-stage flag phase 1 is empty**, `stage_one_end_step` is 0, the warm-up counts from
+step 0, and none of the freeze below applies — exactly the original behaviour, where `--wm_warm_up`
+(default 1000) gated imagination alone and both `dyn` and `rep` ran from step 0.
+
+There are three mutually exclusive variants, ordered by how much they freeze:
+
+| flag | stage one | stage two |
+|---|---|---|
+| `--soft_two_stage` | AC trains on real | posterior frozen |
+| `--hard_two_stage` | AC update skipped entirely | posterior frozen |
+| `--complete_two_stage` | identical to hard | **whole world model frozen except the prior** |
 
 Stage one drops the dynamics loss, since the prior is not being trained yet, and with it the
 KL-balancing representation loss, which only pulls the posterior toward that untrained prior.
@@ -207,7 +215,8 @@ against the posterior's own argmax, which never references the prior — to shar
 during stage one. What remains is reconstruction/prediction (`dec`, `con`, `leg`, `rew`) plus the
 four latent-infoset terms. Soft and hard differ only in the actor-critic: soft keeps training it on
 real trajectories, hard skips `actor_critic.step` outright — no real loss, no imagination loss, no
-critic or target-network update.
+critic or target-network update. `--complete_two_stage` reuses hard's stage one unchanged and
+differs only in stage two.
 
 **After stage one the posterior is frozen**, and that takes *two* independent changes — dropping the
 representation loss alone is not enough.
@@ -216,7 +225,7 @@ representation loss alone is not enough.
    KL-balancing representation loss never runs at all under two-stage training:
 
    ```python
-   two_stage = soft_two_stage or hard_two_stage
+   two_stage = soft_two_stage or hard_two_stage or complete_two_stage
    compute_dynamics = not in_stage_one
    compute_representation = (vq_vae_posterior and in_stage_one) if two_stage else True
    ```
@@ -240,6 +249,77 @@ without it `rep` is 0 for the whole run. Both are intended; the startup banner s
 `freeze_posterior` is static like `two_stage_warm_up`, so the switch is a compile-time branch and
 costs one trace, not a per-step test.
 
+#### `--complete_two_stage`: freeze everything but the prior
+
+The literal reading of "separate representation learning from generative learning". Stage one is
+hard's; stage two freezes the *whole* world model except `dyn` — `enc`, `observer`, `seq`, `dec`,
+`rew`, `term`, `leg` and all three infoset networks stop learning, and only the dynamics network and
+the actor-critic keep training. Three mechanisms, and **all three are needed**:
+
+1. **Detach every loss term but `dyn`.** They are still computed (the forward pass produces the
+   prediction step the actor-critic consumes anyway) and still *reported*, so `dec`/`con`/`leg`/
+   `rew`/`is_*` keep printing — read them as drift of a fixed representation, not as progress. Since
+   `stop_gradient` is the identity forward, the printed compound loss stays comparable across the
+   boundary.
+2. **`stop_gradient` on `dyn`'s input.** The dynamics loss is the one term still training, and its
+   input is `recurrent_state` — without this it would keep training `seq`, and through it everything
+   upstream.
+3. **Restore the frozen parameters after each `train_step`.** A zero gradient is *not* enough:
+   `DreamerMA.optimizer` is one optimizer shared by the world-model and actor-critic updates, and
+   LaProp carries momentum across both, so a network that stops receiving gradient still drifts on
+   leftover momentum. Measured on goofspiel_3 that tail is ~2.5e-5 max |Δw| over the first ten steps
+   past the boundary, decaying geometrically (3e-6, 2e-7, 7e-10) — small, but not frozen.
+   `snapshot_frozen_networks`/`restore_frozen_networks` rebind the arrays around both updates, which
+   is what `optimizer.update` itself does and costs no device work. With it the frozen networks are
+   **bit-identical** across 80 steps while `dyn`, `actor` and `critic` keep moving.
+
+The frozen set is derived as `[k for k in self.network_keys if k != 'dyn']`, not listed, so the
+decentralized model (no infoset networks) gets the right set with nothing to keep in sync. Every
+network is `nnx.Param`-only, so the Param-filtered snapshot misses nothing.
+
+**And at the boundary, the optimizer's moments are reset** (`--complete_two_stage` only).
+`dyn` receives exactly zero gradient throughout stage one and starts at zero, so its `nu`/`mu`
+are still at their init values when stage one ends — but the bias-correction divisor is not:
+`nu_hat = nu / (1 - beta2**step)`, and `step` has been counting all along. The first real
+dynamics gradient is then normalized by an `nu` built from one sample against a divisor that
+assumes thousands, overshooting by up to `sqrt(1/(1-beta2))` = **31.6x** and staying mis-scaled
+for ~1000 steps while `nu` re-warms. That is the error in the rms *normalization*; the realized
+parameter movement is smaller, because momentum contributes only `(1 - beta1)` of it on the first
+step and AGC clips the gradient first. Measured on goofspiel_3 with a 3000-step stage one, `dyn`
+moves **4.0x-8.8x** further per step over the first eight stage-two steps without the reset than
+with it, peaking around step five:
+
+| stage two step | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| no reset | 1.8e-3 | 3.2e-3 | 4.3e-3 | 7.4e-3 | 7.7e-3 | 7.0e-3 | 6.2e-3 | 4.5e-3 |
+| with reset | 4.4e-4 | 4.8e-4 | 5.6e-4 | 8.7e-4 | 8.7e-4 | 9.1e-4 | 9.4e-4 | 8.9e-4 |
+
+Those counters are **single scalars shared by every parameter** (see `make_opt` in
+`nash_dreamer/optimizer.py`), so this cannot be fixed for `dyn` alone — resetting the counter
+while leaving other networks' warm `nu` in place crushes *their* updates by the same factor in
+reverse. Moments and counters must go together, which is exactly why the reset is gated to
+`--complete_two_stage`: there every other world-model network is frozen from that point and the
+actor-critic has never stepped, so nothing useful is discarded. Soft and hard keep the optimizer
+they have; their `dyn` still takes the over-scaled first steps, which is part of what makes them
+the looser variants.
+
+Not reset, deliberately: the **LR schedule's own count** (restarting it would replay
+`OptimizerConfig.warmup`, 1000 by default, from lr 0, and would restart a linear/cosine anneal),
+and `nnx.Optimizer.step` (nothing reads it). `reset_optimizer_moments` asserts the chain layout
+so a change to `make_opt` fails loudly rather than silently zeroing the schedule.
+
+One global worth knowing about while reading any of these counters: **`optimizer.update` is
+called once per world-model step, once by the actor-critic's real loss and once more by its
+imagination loss**, so the shared counters advance at **1x** during a hard/complete stage one,
+**2x** during the warm-up and **3x** afterwards. The LR schedule is therefore keyed to a rate
+that changes at every phase boundary — `--wm_warm_up`-scale numbers in `OptimizerConfig` are not
+in learner steps.
+
+One hazard: the free-bits clamp still applies to `dyn`, so if the dynamics loss sits below
+`--free_bits_threshold` the world model stops learning **altogether** in stage two — `dyn` is the
+only term left that could train anything. Pass `--free_bits_threshold 0` if the latent is small
+enough for that to be a risk.
+
 **How stage one ends.** `DreamerMA.update_stage_one` keeps the last `--loss_check_window` (100)
 values of the compound WM loss in a `deque`, fits a least-squares line once it is full, and ends
 stage one when the drop that line predicts across the window falls below `--stage_one_tol` (1e-3) as
@@ -257,8 +337,10 @@ follow from that formula:
   tolerance would encode sampling noise instead of convergence.
 
 **Reading a run.** `dyn` prints as exactly `0` during stage one and nonzero after; `rep` is nonzero
-during stage one only under `--vq_vae_posterior` and `0` everywhere else; under a hard stage one
-*every* actor-critic metric is 0 until it ends. So the printed metrics say which phase a run is in.
+during stage one only under `--vq_vae_posterior` and `0` everywhere else; under a hard or complete
+stage one *every* actor-critic metric is 0 until it ends. So the printed metrics say which phase a
+run is in — except under `--complete_two_stage`, where the stage-two losses no longer track what is
+learning; `--report_gradnorms` does (every world-model network but `dyn` reads exactly `0`).
 The transition is also logged (`Stage one ended at step N because ...`, naming the step imagination
 will start at).
 

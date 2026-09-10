@@ -338,6 +338,10 @@ class DreamerMAConfig():
   # observer read exactly 0 after the boundary. A run with neither two stage flag has no
   # stage one and is unaffected by any of this.
   #
+  #complete_two_stage goes one step further and freezes the WHOLE world model except the
+  # prior, so that stage two is purely generative learning on top of a fixed representation.
+  # See its field below for what that costs and what still moves.
+  #
   #Two stage training. While the world model warm-up is active (the first
   # wm_warm_up_period gradient steps, the period lives on the actor-critic config)
   # the world model is trained ONLY through the reconstruction/prediction and the
@@ -348,6 +352,23 @@ class DreamerMAConfig():
   # warm-up. At most one of the two flags may be set.
   soft_two_stage: bool = False #The actor-critic keeps training on real trajectories during stage one.
   hard_two_stage: bool = False #The actor-critic is not updated at all during stage one, its steps are skipped.
+  #The strictest variant, and the literal reading of "separate representation learning from
+  # generative learning". Stage one is exactly the hard one: the actor-critic is frozen and
+  # the world model trains on reconstruction plus the infoset terms. Stage two then freezes
+  # EVERYTHING in the world model except the prior -- encoder, observer, sequential network,
+  # decoder, the reward/done/legal heads and all three infoset networks stop learning, and
+  # only the dynamics network and the actor-critic keep training. Implemented by detaching
+  # every loss term but the dynamics one and by feeding the dynamics network a
+  # stop_gradient(recurrent_state), so the frozen networks receive an exactly zero gradient
+  # rather than a small one. Two consequences worth knowing:
+  #  - the reported dec/con/leg/rew/is_* losses are still COMPUTED (the forward pass is
+  #    needed for the prediction step the actor-critic consumes anyway) and still printed,
+  #    they simply no longer train anything. Watching them drift is the point: they say
+  #    whether the frozen representation is still adequate for what the prior has learned.
+  #  - the free bits clamp applies to the dynamics loss as always, so if it sits under
+  #    free_bits_clip_threshold the world model stops learning altogether in stage two.
+  #    Pass --free_bits_threshold 0 if that is a risk for the latent size in use.
+  complete_two_stage: bool = False #Stage two trains ONLY the prior and the actor-critic.
 
   #Stage one ends when the world model's compound loss has plateaued, NOT after a fixed
   # number of steps. The last loss_check_window losses are kept in a ring buffer; once it

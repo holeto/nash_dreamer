@@ -112,16 +112,17 @@ class DecentralizedDreamerMA(DreamerMA):
     terms remain; the four latent-infoset terms have no counterpart here.
 
     two_stage_warm_up is the static flag the inherited `train_step` passes while a
-    --soft_two_stage/--hard_two_stage warm-up runs, with the same meaning as in the
-    centralized model: no dynamics loss, and no representation loss either unless the
-    VQ-VAE commitment term replaces it."""
+    stage one runs, with the same meaning as in the centralized model: no dynamics loss,
+    and no representation loss either unless the VQ-VAE commitment term replaces it."""
     sample_keys = jax.random.split(rng_key, self.non_chance_trajectory_max * self.wm_config.batch_size)
     sample_keys = sample_keys.reshape((self.non_chance_trajectory_max, self.wm_config.batch_size))
     #Same posterior freeze as the centralized model: after stage one the Encoder/Observer output
     # is detached, because _sample_deter is a straight-through estimator and every downstream loss
     # would otherwise keep training them. See dreamer_ma.py for the full reasoning.
-    two_stage = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    two_stage = self.uses_two_stage()
     freeze_posterior = two_stage and not two_stage_warm_up
+    #--complete_two_stage additionally freezes every network but the prior in stage two.
+    freeze_world_model = self.wm_config.complete_two_stage and not two_stage_warm_up
 
     def world_model_loss(ma_rssm: DecentralizedMARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -145,7 +146,10 @@ class DecentralizedDreamerMA(DreamerMA):
         #Independent sample per player -- see DecentralizedMARSSM._sample_deter
         # for why this must not be a single stacked sample_categorical call.
         deterministic_state = model._sample_deter(stochastic_state, cur_key)
-        prior_stochastic_state = per_player(model.dyn, recurrent_state)
+        #Cut the dynamics network's input too, or the one loss still running would keep
+        # training the sequential network that produced it. See dreamer_ma.py.
+        dynamics_input = jax.lax.stop_gradient(recurrent_state) if freeze_world_model else recurrent_state
+        prior_stochastic_state = per_player(model.dyn, dynamics_input)
         prior_stochastic_state = add_uniform_mix(prior_stochastic_state, self.wm_config.uniform_mix)
         #Each player reconstructs only its own observation.
         decoded_obs = per_player(model.dec, recurrent_state, deterministic_state)
@@ -246,7 +250,14 @@ class DecentralizedDreamerMA(DreamerMA):
       wm_keys = self.metrics.keys()
       metrics = {k: v * m for k, v, m in zip(wm_keys, losses, mults)}
 
-      compound_loss = sum(l * m for l, m in zip(losses, mults))
+      if freeze_world_model:
+        #Reported but detached, exactly as in the centralized model.
+        grad_losses = [l if k == 'dyn' else jax.lax.stop_gradient(l)
+                       for k, l in zip(wm_keys, losses)]
+      else:
+        grad_losses = losses
+
+      compound_loss = sum(l * m for l, m in zip(grad_losses, mults))
 
       return compound_loss, (predictions, metrics)
 

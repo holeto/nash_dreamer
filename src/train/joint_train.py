@@ -49,6 +49,7 @@ def train_nash_dreamer(args, game: JaxGame):
       # actor-critic config as wm_warm_up_period and starts counting once stage one is over.
       soft_two_stage = args.soft_two_stage,
       hard_two_stage = args.hard_two_stage,
+      complete_two_stage = args.complete_two_stage,
       loss_check_window = args.loss_check_window,
       stage_one_tol = args.stage_one_tol,
       stage_one_max_steps = args.stage_one_max_steps,
