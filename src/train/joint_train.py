@@ -42,7 +42,16 @@ def train_nash_dreamer(args, game: JaxGame):
 
       jsd=args.jsd,
       max_divergence_scaling = args.max_divergence_scaling,
-      l2_posterior = args.l2_posterior,
+      vq_vae_posterior = args.vq_vae_posterior,
+
+      #Two stage training. Stage one runs BEFORE the warm-up and ends dynamically when the
+      # world model loss plateaus; the warm-up itself keeps its fixed length on the
+      # actor-critic config as wm_warm_up_period and starts counting once stage one is over.
+      soft_two_stage = args.soft_two_stage,
+      hard_two_stage = args.hard_two_stage,
+      loss_check_window = args.loss_check_window,
+      stage_one_tol = args.stage_one_tol,
+      stage_one_max_steps = args.stage_one_max_steps,
 
       # Ordered as (hidden_layer_features, num_hidden_layers)
       sequential_network_details = (args.recurrent_state_size, args.sequential_mlp_features, args.sequential_mlp_layers),
@@ -95,6 +104,7 @@ def train_nash_dreamer(args, game: JaxGame):
         terminal_threshold = args.terminal_threshold,
         legal_threshold = args.legal_threshold,
         wm_warm_up_period = args.wm_warm_up,
+        hard_two_stage = args.hard_two_stage,
 
         # Entropy schedule parameters
         entropy_schedule_size = parse_sequence(args.entropy_schedule_size),
@@ -134,6 +144,7 @@ def train_nash_dreamer(args, game: JaxGame):
         terminal_threshold = args.terminal_threshold,
         legal_threshold = args.legal_threshold,
         wm_warm_up_period = args.wm_warm_up,
+        hard_two_stage = args.hard_two_stage,
 
         #MMD/PPO parameters
         num_epochs = args.num_epochs,

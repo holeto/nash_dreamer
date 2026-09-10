@@ -378,8 +378,11 @@ class DecentralizedRNaDDreamer():
     return prev_network, _prev_network, img_metrics, grad_norms, update_regularization
 
   def step(self, wm_timestep: TimeStep, wm_prediction_step: DecentralizedPredictionStep,
-           trajectory_key: chex.Array):
-    should_imagine = self.learner_steps >= self.config.wm_warm_up_period
+           trajectory_key: chex.Array, should_imagine: bool):
+    #should_imagine is decided by DreamerMA, which is the only thing that knows where stage
+    # one ended and therefore where the warm-up after it ends. This learner's own
+    # learner_steps cannot answer that: a hard stage one leaves the counter behind, and a
+    # soft one lets it run ahead through stage one.
     self.prev_network, self._prev_network, self.metrics, self.grad_norms, update_regularization = \
       self.update_parameters_and_model(self.optimizer, self.target_optimizer, self.prev_network,
                                        self._prev_network, trajectory_key, wm_timestep, wm_prediction_step,

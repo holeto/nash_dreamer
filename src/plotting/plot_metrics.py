@@ -112,7 +112,6 @@ def load_algo_metrics(metric_store_dir, algo_name, game_name, metric):
                 assert current_seed is not None and current_steps is not None
                 values = np.array([float(v) for v in value.split()])
                 seed_data[current_seed] = (current_steps, values)
-
     return seed_data, game_str, algo_str, smoothing_window, uniform_nash_conv, wm_warmup_env_step
 
 

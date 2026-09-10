@@ -1,8 +1,10 @@
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 import optax
+from collections import deque
 from functools import partial
 
 
@@ -107,8 +109,101 @@ class DreamerMA():
       self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
 
     print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
-    
-  
+    self.init_stage_one()
+    self.check_two_stage()
+
+  def init_stage_one(self):
+    """Set up the stage one latch and its rolling window of world model losses.
+
+    Stage one only exists when a two stage flag is given. Without one the run starts
+    already past it, with stage_one_end_step 0, so the warm-up below counts from step 0
+    exactly as it always did."""
+    self.stage_one_active = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    #The learner step at which stage one ended. -1 while it is still running.
+    self.stage_one_end_step = -1 if self.stage_one_active else 0
+    self.stage_one_losses = deque(maxlen=self.wm_config.loss_check_window)
+
+  def check_two_stage(self):
+    """Validate the two stage warm-up flags and report which stage the run starts in."""
+    assert not (self.wm_config.soft_two_stage and self.wm_config.hard_two_stage), (
+      "--soft_two_stage and --hard_two_stage are two variants of the same warm-up and "
+      "cannot be combined. The hard one differs only in also skipping the actor-critic "
+      "update while the warm-up runs.")
+    if not (self.wm_config.soft_two_stage or self.wm_config.hard_two_stage):
+      return
+    assert self.wm_config.loss_check_window > 1, (
+      f"--loss_check_window is {self.wm_config.loss_check_window}, but a line cannot be "
+      f"fitted to fewer than two points. Supply a window of at least 2, and realistically "
+      f"a few tens of steps for the fit to mean anything.")
+    stage = "hard" if self.wm_config.hard_two_stage else "soft"
+    kept = ("the VQ-VAE commitment loss" if self.wm_config.vq_vae_posterior
+            else "no representation loss")
+    frozen = ("the actor-critic is frozen"
+              if self.wm_config.hard_two_stage
+              else "the actor-critic keeps training on real trajectories")
+    cap = (f", or after at most {self.wm_config.stage_one_max_steps} steps"
+           if self.wm_config.stage_one_max_steps > 0 else "")
+    #After stage one the posterior is frozen, so whichever representation term was running
+    # stops. Say so explicitly: a reader watching `rep` drop to 0 at the boundary should not
+    # have to guess whether that is intentional.
+    after = ("the VQ-VAE commitment loss stops with it and the posterior is frozen"
+             if self.wm_config.vq_vae_posterior
+             else "the posterior is frozen, so no representation loss ever runs")
+    print(f"Using {stage} two stage training. Stage one: the world model trains on the "
+          f"reconstruction and infoset losses with {kept} and no dynamics loss, and "
+          f"{frozen}. It ends once the world model loss has plateaued over a window of "
+          f"{self.wm_config.loss_check_window} steps at a relative tolerance of "
+          f"{self.wm_config.stage_one_tol}{cap}. After it, {after} -- only the dynamics "
+          f"loss trains the prior toward it. The {self.ac_config.wm_warm_up_period} "
+          f"step warm-up then runs with imagination still off, and only after that does "
+          f"the actor-critic start imagining.")
+
+  def update_stage_one(self, wm_loss):
+    """Record this step's world model loss and end stage one once it has plateaued.
+
+    Called only while stage one is running, after learner_steps has been incremented, so
+    stage_one_end_step is the number of steps stage one actually lasted. The latch is
+    monotone on purpose: stage one never restarts, which keeps the static jit argument in
+    update_world_model to one flip and one extra trace rather than retracing on every
+    toggle."""
+    #wm_loss is a device scalar. The training loop already blocks every step inside the
+    # replay buffer (np.asarray in env_to_buffer_timestep), so this sync is not a new stall.
+    self.stage_one_losses.append(float(wm_loss))
+    window = self.wm_config.loss_check_window
+    cap = self.wm_config.stage_one_max_steps
+    reason = None
+    if len(self.stage_one_losses) >= window:
+      #Least squares line over the window. The comparison is against the loss LEVEL, so one
+      # tolerance carries across games whose losses differ by an order of magnitude.
+      losses = np.asarray(self.stage_one_losses, dtype=np.float64)
+      slope = np.polyfit(np.arange(window), losses, 1)[0]
+      level = abs(losses.mean())
+      predicted_drop = abs(slope * window)
+      if predicted_drop < self.wm_config.stage_one_tol * level:
+        reason = (f"the world model loss plateaued (fitted drop {predicted_drop:.4g} over "
+                  f"{window} steps, below {self.wm_config.stage_one_tol:g} * {level:.4g})")
+    if reason is None and cap > 0 and self.learner_steps >= cap:
+      reason = f"it hit the --stage_one_max_steps cap of {cap}"
+    if reason is None:
+      return
+    self.stage_one_active = False
+    self.stage_one_end_step = self.learner_steps
+    self.stage_one_losses.clear()
+    print(f"Stage one ended at step {self.stage_one_end_step} because {reason}. The world "
+          f"model now trains on its full loss; imagination starts after a further "
+          f"{self.ac_config.wm_warm_up_period} warm-up steps, at step "
+          f"{self.stage_one_end_step + self.ac_config.wm_warm_up_period}.")
+
+  def imagination_start_step(self):
+    """The learner step at which imagination starts, or -1 while stage one is unfinished.
+
+    This is what evaluation and plotting want as the warm-up boundary: with a dynamic stage
+    one it is model state, not a config value, so it cannot be recomputed from the configs
+    alone the way wm_warm_up_period could."""
+    if self.stage_one_end_step < 0:
+      return -1
+    return self.stage_one_end_step + self.ac_config.wm_warm_up_period
+
   def generate_key(self):
     self.jax_rngs, key = jax.random.split(self.jax_rngs)
     return key
@@ -119,11 +214,25 @@ class DreamerMA():
     return keys
     
   
-  @partial(nnx.jit, static_argnums=(0))
-  def update_world_model(self, optimizer: nnx.Optimizer, timestep: TimeStep, rng_key):
-    """Compound loss for the entire world model."""
+  @partial(nnx.jit, static_argnums=(0, 4))
+  def update_world_model(self, optimizer: nnx.Optimizer, timestep: TimeStep, rng_key,
+                         two_stage_warm_up: bool = False):
+    """Compound loss for the entire world model.
+
+    two_stage_warm_up is a static argument (one extra trace, the same way RNaDDreamer
+    traces its `imagine` flag) and is True only while a --soft_two_stage/--hard_two_stage
+    warm-up is running. It drops the dynamics loss, and with it the KL balancing
+    representation loss unless the VQ-VAE commitment term replaces the latter."""
     sample_keys = jax.random.split(rng_key, self.non_chance_trajectory_max * self.wm_config.batch_size)
     sample_keys = sample_keys.reshape((self.non_chance_trajectory_max, self.wm_config.batch_size))
+    #Once stage one is over the posterior is frozen outright, not merely left without a loss
+    # aimed at it. Dropping the representation term is not enough on its own: sample_categorical
+    # is a straight-through estimator, so gradient from the decoder, the reward/done/legal heads
+    # and the recurrent chain flows back through the sampled state into the observer and the
+    # encoder. Cutting it at the Encoder/Observer output is what actually freezes them.
+    # Static, like two_stage_warm_up, so this is a compile time branch.
+    two_stage = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    freeze_posterior = two_stage and not two_stage_warm_up
     
     def world_model_loss(ma_rssm: MARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -138,6 +247,12 @@ class DreamerMA():
         # there was no previous action so we zero it out
         prev_action = jnp.where(timestep == 0, 0, prev_action)
         stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
+        if freeze_posterior:
+          #The whole Encoder -> Observer output, so nothing downstream can reach their weights.
+          # This also detaches recurrent_state as an OBSERVER input; the sequential network still
+          # trains, since recurrent_state feeds the decoder, the predictors, the dynamics net and
+          # the next-recurrent call directly.
+          stochastic_state = jax.lax.stop_gradient(stochastic_state)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         deterministic_state = sample_categorical(stochastic_state, cur_key)
         prior_stochastic_state = model.get_dynamics_no_jit(recurrent_state)
@@ -211,19 +326,35 @@ class DreamerMA():
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch]
       metric = jsd if self.wm_config.jsd else kl_divergence
-      dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
-      l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
+      #The prior is not trained during stage one, so the dynamics loss is dropped there.
+      # After stage one the POSTERIOR IS FROZEN -- nothing may pull it around any more:
+      #  - the VQ-VAE commitment term sharpens the posterior against its own argmax, so it
+      #    belongs to stage one and stops with it;
+      #  - the KL balancing representation loss pulls the posterior toward the prior, which
+      #    is exactly what freezing forbids, so under two stage training it never runs at all.
+      # l_dyn is deliberately untouched: it carries stop_gradient(posterior), so it trains the
+      # prior TOWARD the frozen posterior without being able to move it. "Frozen" here means
+      # no term whose job is to shape the posterior; reconstruction and the infoset terms still
+      # reach the encoder, as they must for the world model to keep learning at all.
+      # A run with no two stage flag has no stage one and keeps the original behaviour.
+      compute_dynamics = not two_stage_warm_up
+      compute_representation = ((self.wm_config.vq_vae_posterior and two_stage_warm_up)
+                                if two_stage else True)
+      if compute_dynamics:
+        dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
+        l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
       #[Trajectory, Batch]
-      if self.wm_config.l2_posterior:
-        # VQ-VAE style commitment loss: instead of pulling the posterior toward the prior,
-        # sharpen it toward its own per-variable argmax (a stop-gradient one-hot target) --
-        # cross entropy between the posterior and that target, independent of the prior.
-        argmax_target = jax.lax.stop_gradient(
-            jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
-        repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
-      else:
-        repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
-      l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
+      if compute_representation:
+        if self.wm_config.vq_vae_posterior:
+          # VQ-VAE style commitment loss: instead of pulling the posterior toward the prior,
+          # sharpen it toward its own per-variable argmax (a stop-gradient one-hot target) --
+          # cross entropy between the posterior and that target, independent of the prior.
+          argmax_target = jax.lax.stop_gradient(
+              jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
+          repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
+        else:
+          repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+        l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
       #Multiply the prediction losses with
       # the maximum information metric value, to prevent collapse
@@ -290,13 +421,34 @@ class DreamerMA():
     
 
   def train_step(self):
+    #Three sequential phases, and stage one is orthogonal to the warm-up rather than sharing
+    # its budget:
+    #  1. stage one -- the world model drops its dynamics loss (and, unless vq_vae_posterior
+    #     is set, its representation loss), and a hard stage one freezes the actor-critic
+    #     entirely. Ends dynamically, when the world model loss plateaus.
+    #  2. warm-up -- wm_warm_up_period steps on the FULL world model loss, actor-critic
+    #     training on real trajectories only, imagination still off.
+    #  3. everything on.
+    # Without a two stage flag phase 1 is empty and stage_one_end_step is 0, so the warm-up
+    # counts from step 0 and this reduces to the original behaviour exactly.
+    in_stage_one = self.stage_one_active
+    #Imagination is the one decision the actor-critic learners used to make for themselves,
+    # from their own step counters. That cannot express this ordering: under a soft stage one
+    # the learner steps throughout it, so its counter would reach wm_warm_up_period while
+    # still inside stage one and it would imagine far too early. DreamerMA owns the decision
+    # now and passes it down.
+    should_imagine = (not in_stage_one
+                      and self.learner_steps - self.stage_one_end_step >= self.ac_config.wm_warm_up_period)
     buffer_key = self.generate_key()
     timestep = self.buffer.mixed_sample(buffer_key)
     wm_key = self.generate_key()
-    wm_loss, pred_step, self.wm_metrics, self.grad_norms = self.update_world_model(self.optimizer, timestep, wm_key)
-    ac_key = self.generate_key()
-    self.actor_critic.step(timestep, pred_step, ac_key)
+    wm_loss, pred_step, self.wm_metrics, self.grad_norms = self.update_world_model(self.optimizer, timestep, wm_key, in_stage_one)
+    if not (self.wm_config.hard_two_stage and in_stage_one):
+      ac_key = self.generate_key()
+      self.actor_critic.step(timestep, pred_step, ac_key, should_imagine)
     self.learner_steps += 1
+    if in_stage_one:
+      self.update_stage_one(wm_loss)
 
   def train_model(self, model_save_dir:str, num_steps:int, print_each: int = -1, 
                   save_each: int = -1,
@@ -350,7 +502,12 @@ class DreamerMA():
       'game': self.game,
       'jax_rngs': self.jax_rngs,
       'optimizer': nnx.state(self.optimizer),
-      'steps': self.learner_steps
+      'steps': self.learner_steps,
+      #Without these a resume would re-enter stage one, or restart its window, and
+      # train_loop round-trips this through __setstate__ for EVERY seed.
+      'stage_one_active': self.stage_one_active,
+      'stage_one_end_step': self.stage_one_end_step,
+      'stage_one_losses': list(self.stage_one_losses),
     }
     state['gen'] = general_state
     actor_critic_state = self.actor_critic.getstate()
@@ -374,6 +531,24 @@ class DreamerMA():
     self.jax_rngs = gen_state["jax_rngs"]
     nnx.update(self.optimizer, gen_state["optimizer"])
     self.learner_steps = gen_state["steps"]
+    #init() above has already reset these to their start-of-run values, so restore after it.
+    if "stage_one_active" in gen_state:
+      self.stage_one_active = gen_state["stage_one_active"]
+      self.stage_one_end_step = gen_state["stage_one_end_step"]
+      self.stage_one_losses = deque(gen_state["stage_one_losses"],
+                                    maxlen=self.wm_config.loss_check_window)
+    else:
+      #A checkpoint predating the dynamic stage one. Back then stage one WAS the first
+      # wm_warm_up_period steps and imagination began the moment it ended, so map that onto
+      # the new state: it was still inside stage one iff it had not yet reached the period,
+      # and otherwise stage one is over with the warm-up already served from step 0 -- which
+      # leaves should_imagine True, exactly as the old code computed it. Without this a
+      # mature two stage checkpoint would resume by re-running stage one from scratch,
+      # dropping the dynamics loss again thousands of steps into training.
+      self.stage_one_active = (self.stage_one_active
+                               and self.learner_steps < self.ac_config.wm_warm_up_period)
+      self.stage_one_end_step = -1 if self.stage_one_active else 0
+      self.stage_one_losses = deque(maxlen=self.wm_config.loss_check_window)
     self.actor_critic.setstate(state['ac'])
     self.buffer.setstate(state['buffer'])
     

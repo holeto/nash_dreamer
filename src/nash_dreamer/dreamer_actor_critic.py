@@ -130,7 +130,7 @@ class DreamerActorCritic():
   
 
 
-  @partial(nnx.jit, static_argnums=(0,))
+  @partial(nnx.jit, static_argnums=(0, 7))
   def update_paramaters_and_model(
     self,
     optimizer: nnx.Optimizer,
@@ -139,6 +139,7 @@ class DreamerActorCritic():
     wm_timestep: TimeStep,
     wm_prediction_step: PredictionStepWithLegal,
     return_range: chex.Array,
+    imagine: bool,
   ):
     """Compute RNaD loss and use it to perform
     a gradient step of both RNaD and Dreamer."""
@@ -229,16 +230,27 @@ class DreamerActorCritic():
     #starting_points = jax.tree.map(lambda x: jnp.repeat(x[0][None, ...], self.num_starts, axis=0).reshape((-1, *x.shape[2:])), wm_prediction_step)
     starting_points = jax.tree.map(lambda x: x[0].reshape((-1, *x.shape[2:])), wm_prediction_step)
     #jax.tree.map(lambda x: print(x.shape), starting_points)
-    img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
-      optimizer.model,
-      target_optimizer.model,
-      trajectory_key, 
-      starting_points,
-      return_range,
-      self.config.beta_imagination)
-    
-    img_loss, (new_range, img_metrics) = img_return
-    optimizer.update(igrad)       
+    #Until the warm-up after stage one has elapsed there is nothing worth imagining in, so
+    # the whole imagination branch is skipped -- no rollout, no gradient, no optimizer update.
+    # `imagine` is static, so this is a compile-time branch and costs one extra trace when it
+    # flips, exactly as RNaDDreamer's own imagine flag does. Note the return range: normally
+    # imagination_loss advances it and real_loss continues from the advanced value, so when
+    # skipping we must thread the INCOMING range through instead of dropping it.
+    if imagine:
+      img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
+        optimizer.model,
+        target_optimizer.model,
+        trajectory_key, 
+        starting_points,
+        return_range,
+        self.config.beta_imagination)
+      
+      img_loss, (new_range, img_metrics) = img_return
+      optimizer.update(igrad)       
+    else:
+      img_loss, new_range = 0.0, return_range
+      img_metrics = {k: 0 for k in self.metrics_keys[:2]}
+      igrad = {k: 0 for k in self.network_keys}
     r_return, rgrad = nnx.value_and_grad(real_loss, argnums=(0), has_aux=True)(
       optimizer.model,
       target_optimizer.model,
@@ -271,8 +283,12 @@ class DreamerActorCritic():
     return img_loss + r_loss, new_range, img_metrics, grad_norms
 
   
-  def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array):
-    loss, self.return_range, self.metrics, self.grad_norms =  self.update_paramaters_and_model(self.optimizer, self.target_optimizer, trajectory_key, wm_timestep, wm_prediction_step, self.return_range)
+  def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array,
+           should_imagine: bool):
+    #REINFORCE used to imagine from step 0 unconditionally -- it was the one learner with no
+    # warm-up gate at all. It now honours the same boundary as RNaD and MMD, decided centrally
+    # by DreamerMA.
+    loss, self.return_range, self.metrics, self.grad_norms =  self.update_paramaters_and_model(self.optimizer, self.target_optimizer, trajectory_key, wm_timestep, wm_prediction_step, self.return_range, should_imagine)
     self.learner_steps += 1
   
   def getstate(self):

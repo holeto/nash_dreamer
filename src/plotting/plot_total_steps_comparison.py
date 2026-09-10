@@ -127,6 +127,12 @@ def recompute_wm_warmup_env_step(metric_store_dir, algo_dir, game_name, traj_len
     with open(config_path) as f:
         config = json.load(f)
     warm_up_grad_steps = config["ac_config"]["wm_warm_up_period"]
+    #Two stage runs put a dynamic stage one before the warm-up, so the real boundary is
+    #recorded by the model and written out alongside the configs. Older config.json files
+    #have no such key and fall back to the plain warm-up.
+    recorded = config.get("imagination_start_step", -1)
+    if recorded > 0:
+        warm_up_grad_steps = recorded
     if warm_up_grad_steps <= 0:
         return -1
     batch_size = config["wm_config"]["batch_size"]

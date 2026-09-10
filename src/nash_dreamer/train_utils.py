@@ -163,6 +163,14 @@ class RNaDConfig:
   legal_threshold: float = 0.5    # Legal, when we take the sigmoid over the Dreamer produced logits.
   bin_range: int = 20 #Number of the exponentially spaced bins for the value categorical distribution prediction
   wm_warm_up_period: int = 1000 #How many steps to let the world model "warm-up" and only train on real trajectories, before starting to imagine.
+  #DEPRECATED and no longer read by anything. It existed so this learner could correct its
+  # own imagination gate when a hard stage one left its learner_steps behind; DreamerMA now
+  # computes should_imagine centrally and passes it into step(), so there is nothing to
+  # correct. Kept rather than deleted because a chex.dataclass restores a MISSING field from
+  # its class default, but a pickle carrying a field the class no longer declares is the
+  # direction that fails to reconstruct -- removing this would break every checkpoint
+  # written since it was added.
+  hard_two_stage: bool = False
   
   target_network_update: float = 1e-3
 
@@ -222,6 +230,14 @@ class MMDConfig:
                           # unrolled trajectories and beta real for trajectories from the real environment
   num_starts: int = -1 #How many starting points to take from each trajectory for the imagination unroll. If -1 take the same amount as the length of the trajectory.
   wm_warm_up_period: int = 1000 #How many steps to let the world model "warm-up" and only train on real trajectories, before starting to imagine.
+  #DEPRECATED and no longer read by anything. It existed so this learner could correct its
+  # own imagination gate when a hard stage one left its learner_steps behind; DreamerMA now
+  # computes should_imagine centrally and passes it into step(), so there is nothing to
+  # correct. Kept rather than deleted because a chex.dataclass restores a MISSING field from
+  # its class default, but a pickle carrying a field the class no longer declares is the
+  # direction that fails to reconstruct -- removing this would break every checkpoint
+  # written since it was added.
+  hard_two_stage: bool = False
   #Uniform policy mixture used during IMAGINATION (the --img_sampling_epsilon flag).
   # Nonzero means the imagined behaviour policy stored in the timestep is not the
   # policy of the actor itself, so the MMD ratio is not 1 at the first inner epoch.
@@ -300,10 +316,51 @@ class DreamerMAConfig():
   #Distributional loss parameters
   jsd: bool =False #Whether to use JSD or KL for the prior/posterior distance
   max_divergence_scaling: bool = False #Whether to scale the prior/posterior distance
-  l2_posterior: bool = False #If True, replace the representation loss with a VQ-VAE style
+  vq_vae_posterior: bool = False #If True, replace the representation loss with a VQ-VAE style
                               # commitment loss (cross entropy between the posterior and its
                               # own per-variable argmax), sharpening the posterior toward a
                               # deterministic code instead of pulling it toward the prior.
+                              # Under two stage training this term runs during STAGE ONE ONLY;
+                              # see the posterior freeze note below.
+
+  #The posterior is FROZEN once stage one ends, which takes two separate things:
+  #  1. no loss aimed at it -- the VQ-VAE commitment term is stage one only, and the KL
+  #     balancing representation loss never runs at all under two stage training, since
+  #     pulling the posterior toward the prior is exactly what the freeze forbids;
+  #  2. a stop_gradient on the Encoder/Observer output. Point 1 alone does NOT freeze it:
+  #     sample_categorical is a straight-through estimator, so the decoder, the reward/done/
+  #     legal heads and the recurrent chain would all keep training the encoder through the
+  #     sampled state.
+  # The dynamics loss continues and carries stop_gradient(posterior), so it trains the prior
+  # toward the frozen posterior without moving it. The sequential network keeps training too:
+  # recurrent_state feeds the decoder, the predictors and the next-recurrent call directly,
+  # not only through the detached posterior. Check with --report_gradnorms, where enc and
+  # observer read exactly 0 after the boundary. A run with neither two stage flag has no
+  # stage one and is unaffected by any of this.
+  #
+  #Two stage training. While the world model warm-up is active (the first
+  # wm_warm_up_period gradient steps, the period lives on the actor-critic config)
+  # the world model is trained ONLY through the reconstruction/prediction and the
+  # latent-infoset terms: the dynamics loss is dropped entirely, and the KL balancing
+  # representation loss goes with it, since it only pulls the posterior toward a prior
+  # that is not being trained yet. The single exception is vq_vae_posterior, whose
+  # commitment term never looks at the prior and is therefore kept for the whole
+  # warm-up. At most one of the two flags may be set.
+  soft_two_stage: bool = False #The actor-critic keeps training on real trajectories during stage one.
+  hard_two_stage: bool = False #The actor-critic is not updated at all during stage one, its steps are skipped.
+
+  #Stage one ends when the world model's compound loss has plateaued, NOT after a fixed
+  # number of steps. The last loss_check_window losses are kept in a ring buffer; once it
+  # is full, a least squares line is fitted and stage one ends when the total drop that
+  # line predicts across the window falls below stage_one_tol as a FRACTION of the current
+  # loss level: abs(slope * window) < stage_one_tol * abs(mean(window)). The tolerance is
+  # relative because the compound loss is dominated by the reconstruction and infoset
+  # terms, whose scale follows the observation size and so differs by an order of
+  # magnitude between games. Note a loss that is rising steeply does not satisfy this test
+  # and will keep stage one running -- stage_one_max_steps is the backstop for that.
+  loss_check_window: int = 100 #Ring buffer size, and the minimum number of steps before stage one can end.
+  stage_one_tol: float = 1e-3 #Relative tolerance on the fitted drop across the window.
+  stage_one_max_steps: int = -1 #Hard cap on stage one, -1 for no cap.
 
   free_bits_clip_threshold: float = 1 #Threshold for loss clip in free bits.
   uniform_mix: float = 0.01 # Amount of uniform mixture added to the 

@@ -184,6 +184,114 @@ exactly one thing: `game.to_compact_str()` as the directory name.
   `train_loop`, under `trained_networks/ppo_p{player_id}/...`), or sweep it in-memory with
   `eval/ppo_exploitability.py` (see Evaluation).
 
+### Three phases: stage one, the warm-up, then imagination
+
+A NashDreamer run passes through up to three phases, in order. Stage one is **orthogonal to the
+warm-up** — it runs first and ends dynamically, and only when it is over does the fixed
+`--wm_warm_up` budget start counting.
+
+| phase | ends when | world-model loss | actor-critic | imagination |
+|---|---|---|---|---|
+| 1. stage one | the WM loss plateaus (dynamic) | recon + infoset, `rep` only if `--vq_vae_posterior`, no `dyn` | soft: trains on real / hard: frozen | off |
+| 2. warm-up | `--wm_warm_up` steps after phase 1 | recon + infoset + `dyn`; **no `rep` ever** | trains on real | off |
+| 3. full | — | same as phase 2 | trains | on |
+
+**Without `--soft_two_stage`/`--hard_two_stage` phase 1 is empty**, `stage_one_end_step` is 0, the
+warm-up counts from step 0, and none of the freeze below applies — exactly the original behaviour,
+where `--wm_warm_up` (default 1000) gated imagination alone and both `dyn` and `rep` ran from step 0.
+
+Stage one drops the dynamics loss, since the prior is not being trained yet, and with it the
+KL-balancing representation loss, which only pulls the posterior toward that untrained prior.
+`--vq_vae_posterior` (renamed from `--l2_posterior`) substitutes its commitment term — cross entropy
+against the posterior's own argmax, which never references the prior — to sharpen the posterior
+during stage one. What remains is reconstruction/prediction (`dec`, `con`, `leg`, `rew`) plus the
+four latent-infoset terms. Soft and hard differ only in the actor-critic: soft keeps training it on
+real trajectories, hard skips `actor_critic.step` outright — no real loss, no imagination loss, no
+critic or target-network update.
+
+**After stage one the posterior is frozen**, and that takes *two* independent changes — dropping the
+representation loss alone is not enough.
+
+1. **No term aimed at the posterior.** The VQ commitment term stops with stage one, and the
+   KL-balancing representation loss never runs at all under two-stage training:
+
+   ```python
+   two_stage = soft_two_stage or hard_two_stage
+   compute_dynamics = not in_stage_one
+   compute_representation = (vq_vae_posterior and in_stage_one) if two_stage else True
+   ```
+
+2. **`stop_gradient` on the Encoder→Observer output.** `sample_categorical`
+   (`nash_dreamer/distributions.py`) is a **straight-through estimator** —
+   `stop_gradient(one_hot) + (probs - stop_gradient(probs))` — so gradient from the decoder, the
+   reward/done/legal heads and the recurrent chain flows back through the sampled state into the
+   observer and encoder regardless of which losses are on. `update_world_model` therefore detaches
+   `get_encoder_no_jit(...)` (which *is* Encoder→Observer) whenever `freeze_posterior` holds.
+
+`dyn` is deliberately untouched: it carries `stop_gradient(posterior)` already, so it trains the
+prior *toward* the frozen posterior without being able to move it. Everything else keeps
+training — the sequential network still gets gradient because `recurrent_state` feeds the decoder,
+the predictors, the dynamics net and the next-recurrent call *directly*, not only through the
+detached posterior. Verify with `--report_gradnorms`: `enc` and `observer` are exactly `0` after the
+boundary and nonzero before it.
+
+So under `--vq_vae_posterior` the reported `rep` goes nonzero → **0** at the stage-one boundary, and
+without it `rep` is 0 for the whole run. Both are intended; the startup banner says which to expect.
+`freeze_posterior` is static like `two_stage_warm_up`, so the switch is a compile-time branch and
+costs one trace, not a per-step test.
+
+**How stage one ends.** `DreamerMA.update_stage_one` keeps the last `--loss_check_window` (100)
+values of the compound WM loss in a `deque`, fits a least-squares line once it is full, and ends
+stage one when the drop that line predicts across the window falls below `--stage_one_tol` (1e-3) as
+a *fraction* of the current loss level: `abs(slope * window) < tol * abs(mean(window))`. Three things
+follow from that formula:
+
+- The tolerance is **relative** on purpose. The compound loss is dominated by `dec`/`is_obs_dec`/
+  `is_rec_pred`, whose scale follows the observation size, so an absolute delta would need retuning
+  per game.
+- A **steeply rising** loss does not satisfy the test and will keep stage one running.
+  `--stage_one_max_steps` (default -1, no cap) is the backstop.
+- Stage one can never end before the window has filled, so `--loss_check_window` doubles as its
+  minimum length. Fitting a line to a mean of *absolute* successive differences was rejected: at a
+  genuine plateau that statistic settles at the minibatch noise floor rather than near zero, so the
+  tolerance would encode sampling noise instead of convergence.
+
+**Reading a run.** `dyn` prints as exactly `0` during stage one and nonzero after; `rep` is nonzero
+during stage one only under `--vq_vae_posterior` and `0` everywhere else; under a hard stage one
+*every* actor-critic metric is 0 until it ends. So the printed metrics say which phase a run is in.
+The transition is also logged (`Stage one ended at step N because ...`, naming the step imagination
+will start at).
+
+Three consequences worth knowing before changing any of this:
+
+- `DreamerMA.train_step` is the **single source of truth** for `should_imagine`, which it passes into
+  `actor_critic.step(...)`. The learners used to each compute it from their own `learner_steps`, which
+  cannot express this ordering: under a soft stage one the learner steps throughout it, so its counter
+  would reach `wm_warm_up_period` while still inside stage one and it would imagine far too early.
+  The `hard_two_stage` mirror fields on `RNaDConfig`/`MMDConfig` are the remnant of that scheme — now
+  deprecated and read by nothing, kept only because a `chex.dataclass` tolerates a *missing* field but
+  not a stored field the class no longer declares.
+- `DreamerActorCritic` (REINFORCE) had no imagination gate at all and imagined from step 0. It now
+  honours the same boundary, via a new static `imagine` argument on `update_paramaters_and_model`.
+  When skipping, the incoming `return_range` must be threaded through to `real_loss` — normally the
+  imagination branch advances it first.
+- Both `two_stage_warm_up` (in `update_world_model`) and `imagine` are **static** jit arguments, so
+  each phase transition costs one extra trace, not a per-step branch. The stage-one latch is monotone
+  for exactly this reason: it must never flap.
+
+Because stage one is dynamic, the step at which imagination starts is **model state**, not a config
+value. `DreamerMA.imagination_start_step()` reports it, `__getstate__` persists it alongside the latch
+and window (so `--continue_train` resumes in the right phase), and `eval/actor_critic_evaluate.py`
+writes it into `config.json` as `imagination_start_step` for `plotting/plot_total_steps_comparison.py`
+— which otherwise recomputes the boundary from `wm_warm_up_period` alone and would draw it in the
+wrong place.
+
+`dyn`/`rep` still pass through `jnp.maximum(free_bits_clip_threshold, ...)`, so a VQ-VAE term that
+sits under `--free_bits_threshold` (easy with a small latent) contributes no gradient during stage
+one even though it is reported — and, because of the clamp, a disabled term and a clamped one both
+print as the threshold times their beta rather than a bare 0. Pass `--free_bits_threshold 0` when you
+need the printed `rep`/`dyn` to distinguish "off" from "clamped".
+
 ### Decentralized world model (`nash_dreamer/*_decentralized.py`)
 
 A second, parallel world-model implementation. `DecentralizedMARSSM`
@@ -211,7 +319,10 @@ No shell script references any of this yet, and no evaluation script (`eval/poli
 `eval/head_to_head_evaluate.py`) knows about the `Decentralized*` classes — the `python -m` command in
 Commands above is currently the only way to run or inspect it. The world-model update and v-trace logic
 in `rnad_dreamer_decentralized.py` are hand-duplicated from the centralized versions, not shared, so a
-bugfix in `dreamer_ma.py` / `rnad_dreamer.py` does not propagate here automatically.
+bugfix in `dreamer_ma.py` / `rnad_dreamer.py` does not propagate here automatically. It does inherit
+`DreamerMA.train_step`, so the two-stage warm-up above applies unchanged, and its `update_world_model`
+mirrors both the gating and the `--vq_vae_posterior` branch (added there 2026-09-09; before that the
+decentralized copy only ever computed the KL representation loss and silently ignored the flag).
 
 The only game currently wired to it is Perturbed RPS (`src/envs/jax_rps_perturbed.py::JaxPerturbedRPS`,
 a `JaxRPS` subclass, launched via `src/train/perturbed_rps_train.py`), which exists specifically to
@@ -409,5 +520,8 @@ flags steps where obs/reward/terminal/legal diverge past a threshold.
 - Per-game hyperparameters live in hardcoded bash `if [ "$GAME" == ... ]` blocks duplicated across
   `nash_dreamer_train.sh`, `rnad_train.sh`, `mmd_train.sh`, `ppo_train.sh` and their `src/debug/`
   copies — there are no yaml/hydra configs anywhere.
-- `--wm_warm_up` defaults to 1000, so short NashDreamer runs never exercise the imagination path. Set it
-  to 1 when smoke-testing a new game.
+- `--wm_warm_up` defaults to 1000, so short NashDreamer runs never exercise the imagination path. Set
+  it to 1 when smoke-testing a new game. With `--soft_two_stage`/`--hard_two_stage` there is a second
+  boundary in front of it: `--loss_check_window` defaults to 100, which is the minimum length of stage
+  one, so also drop that (and raise `--stage_one_tol`, or set `--stage_one_max_steps`) or a short run
+  never leaves stage one at all.

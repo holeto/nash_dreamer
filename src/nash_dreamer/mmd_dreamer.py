@@ -272,8 +272,12 @@ class MMDDreamer():
 
 
 
-  def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array):
-    should_imagine = self.learner_steps >= self.config.wm_warm_up_period
+  def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array,
+           should_imagine: bool):
+    #should_imagine is decided by DreamerMA, which is the only thing that knows where stage
+    # one ended and therefore where the warm-up after it ends. This learner's own
+    # learner_steps cannot answer that: a hard stage one leaves the counter behind, and a
+    # soft one lets it run ahead through stage one.
     self.metrics, self.grad_norms = self.update_parameters_and_model(self.optimizer, self.target_optimizer,
                                                                     trajectory_key, wm_timestep, wm_prediction_step,
                                                                     should_imagine)

@@ -212,6 +212,8 @@ plots/
 **/*/local_plotting/
 world_model_plots/
 tabular/
+metrics/
+preliminary_metrics/
 cluster*/
 **/*/debug/
 **/*/cluster*/

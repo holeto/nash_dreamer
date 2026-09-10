@@ -97,16 +97,31 @@ class DecentralizedDreamerMA(DreamerMA):
       self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
 
     print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
+    #This class overrides init() wholesale rather than extending DreamerMA's, so the stage
+    # one state has to be set up here too -- train_step is inherited and reads it.
+    self.init_stage_one()
+    self.check_two_stage()
 
-  @partial(nnx.jit, static_argnums=(0))
-  def update_world_model(self, optimizer: nnx.Optimizer, timestep: TimeStep, rng_key):
+  @partial(nnx.jit, static_argnums=(0, 4))
+  def update_world_model(self, optimizer: nnx.Optimizer, timestep: TimeStep, rng_key,
+                         two_stage_warm_up: bool = False):
     """Compound loss for the entire decentralized world model.
 
     Every network is applied per player over a leading player axis, and each
     player's chain is driven by its OWN observation and OWN action. Six loss
-    terms remain; the four latent-infoset terms have no counterpart here."""
+    terms remain; the four latent-infoset terms have no counterpart here.
+
+    two_stage_warm_up is the static flag the inherited `train_step` passes while a
+    --soft_two_stage/--hard_two_stage warm-up runs, with the same meaning as in the
+    centralized model: no dynamics loss, and no representation loss either unless the
+    VQ-VAE commitment term replaces it."""
     sample_keys = jax.random.split(rng_key, self.non_chance_trajectory_max * self.wm_config.batch_size)
     sample_keys = sample_keys.reshape((self.non_chance_trajectory_max, self.wm_config.batch_size))
+    #Same posterior freeze as the centralized model: after stage one the Encoder/Observer output
+    # is detached, because _sample_deter is a straight-through estimator and every downstream loss
+    # would otherwise keep training them. See dreamer_ma.py for the full reasoning.
+    two_stage = self.wm_config.soft_two_stage or self.wm_config.hard_two_stage
+    freeze_posterior = two_stage and not two_stage_warm_up
 
     def world_model_loss(ma_rssm: DecentralizedMARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -124,6 +139,8 @@ class DecentralizedDreamerMA(DreamerMA):
         #Each player encodes only its own observation into its own posterior,
         # which its own recurrent state then contextualizes.
         stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
+        if freeze_posterior:
+          stochastic_state = jax.lax.stop_gradient(stochastic_state)
         stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
         #Independent sample per player -- see DecentralizedMARSSM._sample_deter
         # for why this must not be a single stacked sample_categorical call.
@@ -192,12 +209,30 @@ class DecentralizedDreamerMA(DreamerMA):
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch, num_players]
       metric = jsd if self.wm_config.jsd else kl_divergence
-      dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
-      l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold,
-                           get_loss_mean_with_mask(dynamics_loss, timestep.valid[..., None], normalization_mult=2))
-      repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
-      l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold,
-                           get_loss_mean_with_mask(repr_loss, timestep.valid[..., None], normalization_mult=2))
+      #Same gating as the centralized model, including the posterior freeze after stage one:
+      # the VQ-VAE commitment term is stage one only, and the KL balancing representation loss
+      # never runs under two stage training. See dreamer_ma.py for the full reasoning.
+      compute_dynamics = not two_stage_warm_up
+      compute_representation = ((self.wm_config.vq_vae_posterior and two_stage_warm_up)
+                                if two_stage else True)
+      if compute_dynamics:
+        dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
+        l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold,
+                             get_loss_mean_with_mask(dynamics_loss, timestep.valid[..., None], normalization_mult=2))
+      if compute_representation:
+        if self.wm_config.vq_vae_posterior:
+          # VQ-VAE style commitment loss: instead of pulling the posterior toward the prior,
+          # sharpen it toward its own per-variable argmax (a stop-gradient one-hot target) --
+          # cross entropy between the posterior and that target, independent of the prior.
+          # The two trailing axes summed over are the per-player [classes, categories], the
+          # player axis stays and is averaged by the mask below, as every other term here.
+          argmax_target = jax.lax.stop_gradient(
+              jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
+          repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
+        else:
+          repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+        l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold,
+                             get_loss_mean_with_mask(repr_loss, timestep.valid[..., None], normalization_mult=2))
 
       #Multiply the prediction losses with
       # the maximum information metric value, to prevent collapse

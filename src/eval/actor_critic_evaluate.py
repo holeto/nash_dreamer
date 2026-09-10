@@ -163,12 +163,20 @@ def _env_steps_per_grad_step(model):
 def _config_to_dict(model):
     """Extract config fields as a JSON-serializable dict based on model type."""
     if isinstance(model, DreamerMA):
-        return {
+        out = {
             'wm_config': dataclasses.asdict(model.wm_config),
             'ac_config': dataclasses.asdict(model.ac_config),
             'buffer_config': dataclasses.asdict(model.buffer_config),
             'optimizer_config': dataclasses.asdict(model.opt_config),
         }
+        #Under --soft_two_stage/--hard_two_stage the warm-up no longer starts at step 0: a
+        #dynamic stage one runs first, so the step at which imagination actually starts is
+        #model state and cannot be recovered from the configs alone. Record it explicitly,
+        #the way compute_expl.py already attaches learner_steps. -1 means stage one had not
+        #finished yet in this checkpoint.
+        out['imagination_start_step'] = getattr(model, "imagination_start_step", lambda: -1)()
+        out['stage_one_end_step'] = getattr(model, "stage_one_end_step", 0)
+        return out
     elif isinstance(model, (SimRNaD, SimMMD, SimPPO)):
         out = {'config': dataclasses.asdict(model.config)}
         #SimPPO has no replay buffer, hence no buffer_config
@@ -180,10 +188,17 @@ def _config_to_dict(model):
 
 def _wm_warmup_env_step(model):
     """Return the env step at which the world model warm-up period ends.
-    Returns -1 if the model has no world model or warm-up period is 0."""
+    Returns -1 if the model has no world model or warm-up period is 0.
+
+    With two stage training the boundary is stage_one_end_step + wm_warm_up_period, which
+    is model state rather than a config value, so prefer what the model recorded and fall
+    back to the plain warm-up for checkpoints predating it."""
     if not isinstance(model, DreamerMA):
         return -1
     warm_up_grad_steps = model.ac_config.wm_warm_up_period
+    recorded = getattr(model, "imagination_start_step", lambda: -1)()
+    if recorded > 0:
+        warm_up_grad_steps = recorded
     if warm_up_grad_steps <= 0:
         return -1
     return float(warm_up_grad_steps * _env_steps_per_grad_step(model))
