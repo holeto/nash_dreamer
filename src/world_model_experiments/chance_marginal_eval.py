@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from nash_dreamer.dreamer_ma import DreamerMA
 from nash_dreamer.train_utils import load_model, parse_sequence
 from eval.eval_utils import unroll_chance_node, cartesian_product
+from nash_dreamer.distributions import joint_to_grid
 
 
 parser = ArgumentParser(description="Evaluate world-model chance/next-observation marginal "
@@ -100,6 +101,30 @@ def load_checkpoint(model_dir: str, step: int) -> DreamerMA:
     raise FileNotFoundError(f"No file matching step_{step}.pkl found in {model_dir}.")
 
 
+def enumerate_prior_codes(ma_rssm, recurrent, probability_eps: float):
+    """The prior at `recurrent` as explicit (one-hot grid, probability) pairs.
+
+    The ONLY place in this file that needs to know which prior head is in use.
+
+    A JOINT prior (--joint_prior) is already a distribution over all K ** C codes, so it is
+    filtered directly. probability_eps is rescaled by the ratio of the two uniform masses,
+    (1/K**C) / (1/K): a per class threshold compared against 1/K**C instead of 1/K would be
+    wrong by K**(C-1) and, at the 0.05 default with a (2, 6) latent, would prune every code but
+    the most likely one. The most likely code is always kept so the enumeration is never empty.
+
+    A FACTORED prior is handled by the caller's original per class path, left untouched so
+    previously computed metrics stay comparable."""
+    classes, categories = ma_rssm.encoded_classes, ma_rssm.encoded_categories
+    probs = np.asarray(jax.nn.softmax(ma_rssm.get_dynamics(recurrent), axis=-1))
+    eps = probability_eps / (categories ** (classes - 1))
+    keep = np.nonzero(probs >= eps)[0]
+    if keep.size == 0:
+        keep = np.array([int(np.argmax(probs))])
+    total = probs[keep].sum()
+    grids = np.asarray(joint_to_grid(jnp.asarray(keep), classes, categories))
+    return list(zip(grids, probs[keep] / (total if total > 0 else 1.0)))
+
+
 def _filter_stoch(logits, probability_eps: float):
     """Softmax -> zero out categories below eps -> renormalize (per class)."""
     s = np.asarray(jax.nn.softmax(logits, axis=-1))
@@ -119,6 +144,9 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
     error_threshold = 1.0 - args.upper_bound
     prob_eps = args.probability_eps
     policy_eps = args.policy_eps
+    #--joint_prior replaces the C independent categoricals with one distribution over all K ** C
+    # codes, so the prior can no longer be filtered or expanded per class.
+    joint_prior = bool(getattr(ma_rssm, "joint_prior", False))
 
     def get_both_obs(state):
         _, p1_obs, p2_obs, _ = game.get_info(state)
@@ -131,26 +159,32 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
     start_time = time.time()
 
     def evaluate_marginal(prior_stoch, recurrent, target_obs):
-        """prior_stoch [classes, categories]; target_obs [K, players, obs_dim].
+        """prior_stoch [classes, categories], or None when the prior is a joint head;
+        target_obs [K, players, obs_dim].
         Returns (model_dist [K], error, per_outcome_deter [K])."""
-        num_classes, num_categories = prior_stoch.shape
-        mask = prior_stoch >= prob_eps
-        per_class = []
-        for c in range(num_classes):
-            cats = np.nonzero(mask[c])[0]
-            if cats.size == 0:  # keep at least the argmax so the product is never empty
-                cats = np.array([int(np.argmax(prior_stoch[c]))])
-            per_class.append(cats)
-        combos = cartesian_product(*per_class)  # [num_combos, num_classes]
+        if prior_stoch is None:
+            #Joint head: the codes and their probabilities come straight off the joint.
+            codes = enumerate_prior_codes(ma_rssm, recurrent, prob_eps)
+        else:
+            num_classes, num_categories = prior_stoch.shape
+            mask = prior_stoch >= prob_eps
+            per_class = []
+            for c in range(num_classes):
+                cats = np.nonzero(mask[c])[0]
+                if cats.size == 0:  # keep at least the argmax so the product is never empty
+                    cats = np.array([int(np.argmax(prior_stoch[c]))])
+                per_class.append(cats)
+            combos = cartesian_product(*per_class)  # [num_combos, num_classes]
+            codes = [(jax.nn.one_hot(comb, num_categories),
+                      float(np.prod(prior_stoch[np.arange(num_classes), comb])))
+                     for comb in combos]
 
         K = target_obs.shape[0]
         model_dist = np.zeros(K)
         error = 0.0
         best_dist = np.full(K, np.inf)
         best_deter = [None] * K
-        for comb in combos:
-            prob = float(np.prod(prior_stoch[np.arange(num_classes), comb]))
-            deter = jax.nn.one_hot(comb, num_categories)  # [classes, categories]
+        for deter, prob in codes:
             decoded = np.asarray(ma_rssm.get_decoder(recurrent, deter))  # [players, obs_dim]
             dists = np.max(np.abs(decoded[None] - target_obs), axis=(-1, -2))  # [K]
             j = int(np.argmin(dists))
@@ -172,7 +206,9 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
         node_count[0] += 1
         if args.verbose and node_count[0] % 200 == 0:
             print(f"  {node_count[0]} transitions, depth {depth}, {time.time() - start_time:.1f}s")
-        prior = _filter_stoch(ma_rssm.get_dynamics(recurrent), prob_eps)
+        #A joint prior is enumerated inside evaluate_marginal instead -- its codes cannot be
+        # filtered per class, which is the entire point of the parameterization.
+        prior = None if joint_prior else _filter_stoch(ma_rssm.get_dynamics(recurrent), prob_eps)
 
         if game.is_chance(child_state):
             num_valid = int(game.depth_chance_valid_outcomes(depth))

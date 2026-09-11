@@ -43,6 +43,7 @@ def train_nash_dreamer(args, game: JaxGame):
       jsd=args.jsd,
       max_divergence_scaling = args.max_divergence_scaling,
       vq_vae_posterior = args.vq_vae_posterior,
+      joint_prior = args.joint_prior,
 
       #Two stage training. Stage one runs BEFORE the warm-up and ends dynamically when the
       # world model loss plateaus; the warm-up itself keeps its fixed length on the

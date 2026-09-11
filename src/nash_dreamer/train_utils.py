@@ -303,6 +303,24 @@ class DreamerMAConfig():
   encoded_classes: int # Number of classes for each categorical distribution in state
   encoded_categories: int # Number of categorical distributions in state
 
+  #The prior is normally encoded_classes INDEPENDENT categoricals, so the distribution it can
+  # represent is always a product of its per class marginals -- and the dynamics loss cannot see
+  # the difference either, since kl_divergence sums over the class axis. Whenever a transition's
+  # outcomes are correlated across classes, that costs exactly log(K**C / N) nats for N
+  # equiprobable outcomes, and leaves 1 - N/K**C of the prior's mass on combinations that can
+  # never occur. Leduc's root deals two distinct cards: 30 outcomes in a 6x6 grid, so a sixth of
+  # the prior sits on "both players hold the same card" no matter how well it is trained.
+  #With joint_prior the prior instead emits ONE distribution over all encoded_categories **
+  # encoded_classes joint codes and can represent the dependency exactly. The POSTERIOR stays
+  # factored: each per sample posterior is already a near point mass, which factorizes exactly,
+  # and keeping it factored preserves its straight-through behaviour. The prior itself is never
+  # on a straight-through path -- the only sampled-and-differentiated latent is the posterior's,
+  # and every imagination rollout is stop_gradient'd by its caller -- so a flat prior does not
+  # inherit the instability a flat POSTERIOR (encoded_classes 1) shows.
+  #ONLY VIABLE FOR SMALL FACTORIZATIONS: the head is encoded_categories ** encoded_classes wide.
+  # Fine for everything in this repo, hopeless at DreamerV3's 32x32, where an autoregressive
+  # prior would be needed instead. DreamerMA.init asserts the product stays small.
+  joint_prior: bool = False
 
   use_original_infoset: bool = False
   report_gradnorms: bool = False # Whether to report world model gradient norms

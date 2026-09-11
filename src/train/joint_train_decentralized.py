@@ -59,6 +59,9 @@ def train_nash_dreamer_decentralized(args, game: JaxGame):
       jsd=args.jsd,
       max_divergence_scaling = args.max_divergence_scaling,
       vq_vae_posterior = args.vq_vae_posterior,
+      #Passed through only so DecentralizedDreamerMA.init can REJECT it. Dropping it here
+      # instead would leave the config False and silently ignore the flag.
+      joint_prior = args.joint_prior,
 
       #Two stage training. Stage one runs BEFORE the warm-up and ends dynamically when the
       # world model loss plateaus; the warm-up itself keeps its fixed length on the

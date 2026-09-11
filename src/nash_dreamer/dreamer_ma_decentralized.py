@@ -97,8 +97,15 @@ class DecentralizedDreamerMA(DreamerMA):
       self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
 
     print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
-    #This class overrides init() wholesale rather than extending DreamerMA's, so the stage
-    # one state has to be set up here too -- train_step is inherited and reads it.
+    #This class overrides init() wholesale rather than extending DreamerMA's, so anything
+    # DreamerMA.init does has to be repeated here. That includes rejecting --joint_prior:
+    # DecentralizedMARSSM builds its own per player DynamicsPredictor, so the joint head would
+    # have to be ported there separately. Failing loudly beats silently ignoring the flag and
+    # reporting a factored prior's numbers as if they came from a joint one.
+    assert not self.wm_config.joint_prior, (
+      "--joint_prior is not implemented for the decentralized world model, only the centralized "
+      "one. Its prior is applied per player through its own DynamicsPredictor and needs its own "
+      "port, which is deliberately out of scope until the centralized version is validated.")
     self.init_stage_one()
     self.check_two_stage()
 

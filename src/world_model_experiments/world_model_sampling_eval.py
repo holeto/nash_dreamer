@@ -212,9 +212,10 @@ class Sampler:
             # --- Advance the model with the sampled action + prior-sampled latent. ---
             next_recurrent = ma_rssm.get_next_recurrent_no_jit(
                 carry.recurrent_state, carry.deter_state, action_oh)
-            next_stoch = ma_rssm.get_dynamics_no_jit(next_recurrent)
-            next_deter = sample_categorical(next_stoch, state_sample_key,
-                                            sample_threshold=ma_rssm.state_sample_threshold)
+            #Goes through MARSSM so a joint prior has its classes sampled together; this loop
+            # is otherwise a verbatim copy of ma_rssm.imagine_trajectory's.
+            next_deter = ma_rssm.sample_prior_no_jit(next_recurrent, state_sample_key,
+                                                     sample_threshold=ma_rssm.state_sample_threshold)
             # Centralized decoder: the imagined observation AFTER playing the action.
             model_next_obs = ma_rssm.get_decoder_no_jit(next_recurrent, next_deter, return_logits=False)
 

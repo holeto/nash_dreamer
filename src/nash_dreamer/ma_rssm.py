@@ -5,7 +5,7 @@ from functools import partial
 
 from nash_dreamer.networks import *
 from nash_dreamer.optimizer import make_opt
-from nash_dreamer.distributions import sample_categorical
+from nash_dreamer.distributions import sample_categorical, sample_joint_categorical
 from nash_dreamer.train_utils import *
 from envs.jax_game import JaxGame
 
@@ -95,12 +95,17 @@ class MARSSM(nnx.Module):
                                    wm_config.legal_actions_network_details[0],
                                    wm_config.legal_actions_network_details[1],
                                    rngs)
+    #Whether the prior is one joint distribution over K ** C codes or C independent ones. Read
+    # by get_dynamics* and by imagine_trajectory, which must sample the classes TOGETHER when it
+    # is set -- drawing them independently would rebuild the outer product this exists to avoid.
+    self.joint_prior = wm_config.joint_prior
     self.dyn = DynamicsPredictor(rec_state_size,
                                  wm_config.encoded_classes,
                                  wm_config.encoded_categories,
                                  wm_config.dynamics_network_details[0],
                                  wm_config.dynamics_network_details[1],
-                                 rngs=rngs)
+                                 rngs=rngs,
+                                 joint=wm_config.joint_prior)
     self.enc = Encoder(self.num_players,
                                 self.observation_size,
                                 enc_tokens,
@@ -254,6 +259,19 @@ class MARSSM(nnx.Module):
   def get_dynamics(self, recurrent_state:chex.Array):
     return MARSSM.call_net(self.dyn, recurrent_state)
   
+  def sample_prior_no_jit(self, recurrent_state: chex.Array, key, sample_threshold: float = 0.0):
+    """Sample the PRIOR's latent as a [classes, categories] one-hot grid, for either head.
+
+    Every place that rolls the model forward from the prior goes through here, so the rule that
+    a joint prior must have its classes sampled TOGETHER cannot be forgotten at one of them.
+    Drawing each class from its own marginal instead would rebuild the outer product and put the
+    rollout straight back onto code combinations the joint prior exists to rule out."""
+    stochastic_state = self.get_dynamics_no_jit(recurrent_state)
+    if self.joint_prior:
+      return sample_joint_categorical(stochastic_state, key, self.encoded_classes,
+                                      self.encoded_categories, sample_threshold)
+    return sample_categorical(stochastic_state, key, sample_threshold)
+
   def get_dynamics_no_jit(self, recurrent_state:chex.Array):
     return MARSSM.call_net(self.dyn, recurrent_state)
   
@@ -434,8 +452,8 @@ class MARSSM(nnx.Module):
       
       
       next_recurrent = ma_rssm.get_next_recurrent_no_jit(carry.recurrent_state, carry.deter_state, action_oh)
-      next_stoch = ma_rssm.get_dynamics_no_jit(next_recurrent)
-      next_deter = sample_categorical(next_stoch, state_sample_key, sample_threshold=ma_rssm.state_sample_threshold)
+      next_deter = ma_rssm.sample_prior_no_jit(next_recurrent, state_sample_key,
+                                               sample_threshold=ma_rssm.state_sample_threshold)
 
       #We need the centralized decoder here. Since we are asking 
       # about the observation AFTER playing the action. So, this is actually

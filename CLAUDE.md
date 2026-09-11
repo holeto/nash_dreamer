@@ -374,6 +374,72 @@ one even though it is reported — and, because of the clamp, a disabled term an
 print as the threshold times their beta rather than a bare 0. Pass `--free_bits_threshold 0` when you
 need the printed `rep`/`dyn` to distinguish "off" from "clamped".
 
+### The prior is factored, and `--joint_prior`
+
+By default the prior (`dyn`) is `encoded_classes` **independent** categoricals, and
+`kl_divergence` ([nash_dreamer/distributions.py](src/nash_dreamer/distributions.py)) sums the KL
+over the class axis. So the dynamics loss decomposes into per-class matching problems whose
+optimum is the **product of the per-class posterior marginals** — the prior cannot represent a
+dependency between the classes, and the loss cannot see one either.
+
+Where a transition's outcomes are correlated across classes, that is not a tuning problem, it is
+the objective's blind spot. On Leduc with a `(2, 6)` latent the root deals two *distinct* cards:
+30 reachable outcomes in a 36-cell grid, the 6 holes being "both players hold the same card".
+Measured at 30 000 steps, the prior sat **0.0002** from the exact factored optimum with
+**16.67 %** of its mass on those impossible cells — and re-pairing the classes while preserving
+the marginals moved the gradient by 2.1e-8. Deterministic games are unaffected: a deterministic
+transition gives a point-mass joint posterior, which factorizes exactly.
+
+In general the cost is `log(K^C / N)` nats and `1 − N/K^C` of leaked mass for `N` equiprobable
+outcomes. `src/debug/leduc_root_code_marginals.py` measures all of it exactly.
+
+**`--joint_prior`** makes `dyn` emit **one** softmax over all `encoded_categories **
+encoded_classes` joint codes instead. Three things make this cheap:
+
+- **The posterior stays factored.** Each per-sample posterior is already a near point mass, and
+  a point mass factorizes exactly — the correlation lives only in the *marginal*, which is the
+  prior's job. The loss expresses the factored posterior as its joint (`factored_to_joint`) and
+  reuses `kl_divergence` unchanged by giving both a singleton class axis.
+- **The prior is never on a straight-through path.** The only STE sample is the posterior's; every
+  imagination rollout is `stop_gradient`'d by its caller. So a flat prior does not inherit the
+  instability a flat *posterior* (`--encoded_classes 1`) shows.
+- **Nothing downstream changes shape.** The *sample* is still a `(C, K)` one-hot grid, so
+  `SequenceModel`, `Decoder` and the reward/done/legal heads are untouched.
+
+`--free_bits_threshold` and `--max_divergence_scaling` need no retuning: `maximum_divergence`
+already uses `log(K^C)`, which equals the factored bound `C·log K`.
+
+**Only for small factorizations.** The head is `K^C` wide; `DreamerMA.check_joint_prior` caps it
+at 4096 and says so. A DreamerV3-sized latent would need an autoregressive prior
+`p(z_c | z_<c)` instead — which the untouched posterior leaves open.
+
+Three traps if you change any of this:
+
+- **Imagination must sample the classes together** (`sample_joint_categorical`). Drawing each
+  class from its own marginal rebuilds the outer product exactly, silently reintroducing the bug
+  in the one place it does real damage. `joint_marginals` exists for diagnostics only and is
+  named to say so.
+- **Thresholds are per-class quantities.** `--state_sample_threshold` (and
+  `--probability_eps` in the evaluators) is compared against `1/K`; against a joint's `1/K^C` it
+  is wrong by `K^(C-1)`. Both joint paths rescale it by the ratio of the two uniform masses.
+  With the 0.05 default on a `(2, 6)` latent that is the difference between pruning nothing and
+  pruning all but the single most likely code.
+- **`add_uniform_mix` mixes over `K^C`** rather than per class, which shifts the KL floor
+  slightly.
+
+Coverage: the flag is **centralized-only**. `chance_marginal_eval.py` and
+`posterior_collapse_eval.py` handle both heads; `chance_code_usage.py` and
+`envs/model_game.py` are unaffected because they read the *posterior*;
+`eval/dreamer_ma_evaluate.py` and the decentralized world model **assert** rather than
+silently mis-report.
+
+Old checkpoints are safe because the field is opt-in: `joint_prior` is pickled with the config,
+a `chex.dataclass` restores the missing field as `False`, and `init()` then rebuilds the factored
+head at matching shapes. This matters beyond restore — `train_loop` round-trips
+`template_model.__setstate__(model.__getstate__())` for every seed, and `nnx.update` does **not**
+validate shapes (it bypasses the check), so a mismatch would load silently and crash later
+inside a jit trace.
+
 ### Decentralized world model (`nash_dreamer/*_decentralized.py`)
 
 A second, parallel world-model implementation. `DecentralizedMARSSM`

@@ -36,10 +36,10 @@ import jax.numpy as jnp
 
 from nash_dreamer.dreamer_ma import DreamerMA
 from nash_dreamer.train_utils import parse_sequence
-from nash_dreamer.distributions import add_uniform_mix, kl_divergence
+from nash_dreamer.distributions import add_uniform_mix, kl_divergence, factored_to_joint
 from eval.eval_utils import unroll_chance_node, cartesian_product
 from world_model_experiments.chance_marginal_eval import (
-    load_checkpoint, discover_checkpoint_steps, _filter_stoch,
+    load_checkpoint, discover_checkpoint_steps, _filter_stoch, enumerate_prior_codes,
 )
 
 
@@ -82,6 +82,9 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
     uniform_mix = model.wm_config.uniform_mix
     prob_eps = args.probability_eps
     policy_eps = args.policy_eps
+    #--joint_prior makes the prior one distribution over all K ** C codes, which changes both the
+    # KL below (the posterior must be joined to match it) and how its codes are enumerated.
+    joint_prior = bool(getattr(ma_rssm, "joint_prior", False))
 
     def get_both_obs(state):
         _, p1_obs, p2_obs, _ = game.get_info(state)
@@ -94,24 +97,31 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
     start_time = time.time()
 
     def select_closest_deter(prior_stoch, recurrent, target_obs):
-        """Enumerate prior_stoch's filtered categorical combos, decode each, and
-        return whichever one decodes closest (L-inf) to the single real target_obs
-        [players, obs_dim]. Mirrors chance_marginal_eval.py's evaluate_marginal, minus
-        the error/model_dist bookkeeping this script doesn't need."""
-        num_classes, num_categories = prior_stoch.shape
-        mask = prior_stoch >= prob_eps
-        per_class = []
-        for c in range(num_classes):
-            cats = np.nonzero(mask[c])[0]
-            if cats.size == 0:  # keep at least the argmax so the product is never empty
-                cats = np.array([int(np.argmax(prior_stoch[c]))])
-            per_class.append(cats)
-        combos = cartesian_product(*per_class)  # [num_combos, num_classes]
+        """Enumerate the prior's filtered codes, decode each, and return whichever one decodes
+        closest (L-inf) to the single real target_obs [players, obs_dim]. Mirrors
+        chance_marginal_eval.py's evaluate_marginal, minus the error/model_dist bookkeeping this
+        script doesn't need.
+
+        prior_stoch is [classes, categories], or None when the prior is a joint head -- whose
+        codes cannot be filtered or expanded per class, so they come from the shared
+        enumerate_prior_codes instead."""
+        if prior_stoch is None:
+            deters = [grid for grid, _ in enumerate_prior_codes(ma_rssm, recurrent, prob_eps)]
+        else:
+            num_classes, num_categories = prior_stoch.shape
+            mask = prior_stoch >= prob_eps
+            per_class = []
+            for c in range(num_classes):
+                cats = np.nonzero(mask[c])[0]
+                if cats.size == 0:  # keep at least the argmax so the product is never empty
+                    cats = np.array([int(np.argmax(prior_stoch[c]))])
+                per_class.append(cats)
+            combos = cartesian_product(*per_class)  # [num_combos, num_classes]
+            deters = [jax.nn.one_hot(comb, num_categories) for comb in combos]
 
         best_dist = np.inf
         best_deter = None
-        for comb in combos:
-            deter = jax.nn.one_hot(comb, num_categories)  # [classes, categories]
+        for deter in deters:
             decoded = np.asarray(ma_rssm.get_decoder(recurrent, deter))  # [players, obs_dim]
             dist = float(np.max(np.abs(decoded - target_obs)))
             if dist < best_dist:
@@ -125,6 +135,12 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
         where expected_kl still needs to be weighted by the caller's gt_dist."""
         prior_probs = np.asarray(jax.nn.softmax(
             add_uniform_mix(ma_rssm.get_dynamics_no_jit(recurrent), uniform_mix), axis=-1))
+        #Under --joint_prior the prior is one distribution over all K ** C codes, so the factored
+        # posterior has to be expressed as its joint before the two can be compared -- exactly as
+        # the training loss does it, so the number stays the same quantity dyn reports. Both get a
+        # singleton class axis, which makes kl_divergence's sum over axis=(-1, -2) the joint KL.
+        if joint_prior:
+            prior_probs = prior_probs[..., None, :]
 
         K = target_obs.shape[0]
         kl_per_outcome = np.zeros(K)
@@ -132,9 +148,14 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
         for i in range(K):
             posterior_logits = ma_rssm.get_encoder_no_jit(recurrent, target_obs[i])
             posterior_probs = jax.nn.softmax(add_uniform_mix(posterior_logits, uniform_mix), axis=-1)
-            kl_per_outcome[i] = float(kl_divergence(posterior_probs, prior_probs))
+            kl_posterior = (factored_to_joint(posterior_probs, ma_rssm.encoded_classes)[..., None, :]
+                            if joint_prior else posterior_probs)
+            kl_per_outcome[i] = float(kl_divergence(kl_posterior, prior_probs))
+            #The stored deter stays the FACTORED posterior's argmax grid either way -- it is the
+            # latent the walk continues from, and the posterior is factored in both cases.
             per_outcome_deter[i] = jax.nn.one_hot(
                 jnp.argmax(posterior_probs, axis=-1), posterior_probs.shape[-1])
+        #jax.debug.breakpoint()
         return kl_per_outcome, per_outcome_deter
 
     def process_transition(recurrent, action_oh, parent_infoset, reach_prob,
@@ -176,7 +197,7 @@ def run_for_model(model: DreamerMA, args) -> list[dict]:
             return following
 
         target_obs = np.asarray(get_both_obs(child_state))  # [players, obs_dim]
-        prior = _filter_stoch(ma_rssm.get_dynamics(recurrent), prob_eps)
+        prior = None if joint_prior else _filter_stoch(ma_rssm.get_dynamics(recurrent), prob_eps)
         best_deter = select_closest_deter(prior, recurrent, target_obs)
         if bool(child_terminal):
             return []

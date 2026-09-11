@@ -277,17 +277,26 @@ class Decoder(nnx.Module):
 class DynamicsPredictor(nnx.Module):
   """Recieve a current hidden state and return the current stochastic state logits.
   Acts as a prior to the encoders posterior."""
-  def __init__(self, recurrent_state_size, encoded_classes, encoded_categories, hidden_features, num_layers, rngs: nnx.Rngs) -> None:
+  def __init__(self, recurrent_state_size, encoded_classes, encoded_categories, hidden_features, num_layers, rngs: nnx.Rngs, joint: bool = False) -> None:
     self.encoded_classes = encoded_classes
     self.encoded_categories = encoded_categories
+    #With joint set (the --joint_prior flag) this head emits ONE distribution over all
+    # encoded_categories ** encoded_classes joint codes rather than encoded_classes independent
+    # ones, so the prior can represent a dependency between the classes. Output shape differs
+    # accordingly: flat [..., K ** C] instead of the [..., C, K] grid. Only the OUTPUT changes --
+    # every consumer of the latent takes the sampled one-hot grid, which keeps its shape.
+    self.joint = joint
     self.init_layer = LinNormRelu(recurrent_state_size, hidden_features, rngs)
     self.core_mlp = HiddenMLP(hidden_features, num_layers, rngs)
-    self.last_layer = nnx.Linear(hidden_features, encoded_classes * encoded_categories, rngs=rngs)
+    out_features = (encoded_categories ** encoded_classes) if joint else (encoded_classes * encoded_categories)
+    self.last_layer = nnx.Linear(hidden_features, out_features, rngs=rngs)
     
   def __call__(self, recurrent_state: chex.Array):
     x = self.init_layer(recurrent_state)
     x = self.core_mlp(x)
     x = self.last_layer(x)
+    if self.joint:
+      return x
     encoded_state = x.reshape(*x.shape[:-1], self.encoded_classes, self.encoded_categories)
     return encoded_state
   

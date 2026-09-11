@@ -19,6 +19,11 @@ from nash_dreamer.mmd_dreamer import MMDDreamer
 
 
 
+#Guard rail for --joint_prior: the prior head has one output per joint latent code, so the
+# parameterization is only tractable while encoded_categories ** encoded_classes stays small.
+JOINT_PRIOR_MAX_CODES = 4096
+
+
 class DreamerMA():
   def __init__(self, config: DreamerMAConfig, buffer_config: BufferConfig,
                ac_config:RNaDConfig| ActorCriticConfig, opt_config: OptimizerConfig
@@ -109,8 +114,32 @@ class DreamerMA():
       self.maximum_divergence = 2 * (jnp.log(self.wm_config.encoded_categories ** self.wm_config.encoded_classes) - jnp.log((self.wm_config.uniform_mix)))
 
     print(f"Using {'JSD' if self.wm_config.jsd else 'KL'} for prior/posterior distance. Maximum value is {self.maximum_divergence}")
+    self.check_joint_prior()
     self.init_stage_one()
     self.check_two_stage()
+
+  def check_joint_prior(self):
+    """Validate --joint_prior and report what it changes.
+
+    The head is encoded_categories ** encoded_classes wide, so this is only viable while that
+    product is small. The cap is a guard rail, not a tuned number: it is there so an accidental
+    --joint_prior on a DreamerV3 sized latent fails immediately with an explanation instead of
+    trying to allocate an astronomically wide output layer."""
+    if not self.wm_config.joint_prior:
+      return
+    num_codes = self.wm_config.encoded_categories ** self.wm_config.encoded_classes
+    assert num_codes <= JOINT_PRIOR_MAX_CODES, (
+      f"--joint_prior needs one output per joint latent code, and "
+      f"encoded_categories ** encoded_classes = {self.wm_config.encoded_categories} ** "
+      f"{self.wm_config.encoded_classes} = {num_codes} exceeds the cap of "
+      f"{JOINT_PRIOR_MAX_CODES}. A joint head only works for small factorizations; a large one "
+      f"needs an autoregressive prior, p(z_c | z_<c), which keeps the exact same posterior.")
+    print(f"Using a JOINT prior over {num_codes} latent codes instead of "
+          f"{self.wm_config.encoded_classes} independent categoricals of "
+          f"{self.wm_config.encoded_categories}. The prior can now represent a dependency "
+          f"between the classes, so it is no longer forced to spread mass over every code "
+          f"combination whose per class marginals are individually plausible. The posterior "
+          f"stays factored, and imagination samples the classes together.")
 
   def uses_two_stage(self):
     """True when any of the three two stage variants is in effect.
@@ -469,6 +498,18 @@ class DreamerMA():
       prior = nnx.softmax(predictions.dynamics_state, axis=-1)
       #[Trajectory, Batch]
       metric = jsd if self.wm_config.jsd else kl_divergence
+      #kl_divergence/jsd sum over axis=(-1, -2), i.e. over the class axis -- which is exactly
+      # what makes the loss blind to any dependency BETWEEN the classes, and why a factored prior
+      # converges to the product of its per class marginals.
+      #Under --joint_prior the prior is instead one distribution over all K ** C joint codes, so
+      # the factored posterior has to be expressed as its joint to be compared against it. Giving
+      # both a singleton class axis lets the same metric compute the JOINT divergence with no
+      # change to distributions.py: the sum over a length-1 class axis is the joint term itself.
+      if self.wm_config.joint_prior:
+        kl_posterior = factored_to_joint(posterior, self.wm_config.encoded_classes)[..., None, :]
+        kl_prior = prior[..., None, :]
+      else:
+        kl_posterior, kl_prior = posterior, prior
       #The prior is not trained during stage one, so the dynamics loss is dropped there.
       # After stage one the POSTERIOR IS FROZEN -- nothing may pull it around any more:
       #  - the VQ-VAE commitment term sharpens the posterior against its own argmax, so it
@@ -484,7 +525,7 @@ class DreamerMA():
       compute_representation = ((self.wm_config.vq_vae_posterior and two_stage_warm_up)
                                 if two_stage else True)
       if compute_dynamics:
-        dynamics_loss = metric(jax.lax.stop_gradient(posterior), prior)
+        dynamics_loss = metric(jax.lax.stop_gradient(kl_posterior), kl_prior)
         l_dyn += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(dynamics_loss, timestep.valid))
       #[Trajectory, Batch]
       if compute_representation:
@@ -496,7 +537,9 @@ class DreamerMA():
               jax.nn.one_hot(jnp.argmax(posterior, axis=-1), posterior.shape[-1]))
           repr_loss = -jnp.sum(argmax_target * jnp.log(posterior), axis=(-1, -2))
         else:
-          repr_loss = metric(posterior, jax.lax.stop_gradient(prior))
+          #The VQ branch above stays on the FACTORED posterior -- its target is a per class
+          # argmax, which has no joint counterpart. Only the KL balancing term needs the joint.
+          repr_loss = metric(kl_posterior, jax.lax.stop_gradient(kl_prior))
         l_rep += jnp.maximum(self.wm_config.free_bits_clip_threshold, get_loss_mean_with_mask(repr_loss, timestep.valid))
 
       #Multiply the prediction losses with

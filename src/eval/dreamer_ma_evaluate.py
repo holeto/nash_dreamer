@@ -127,6 +127,18 @@ def model_walk_test(model:DreamerMA,
   vectorized_get_obs = jax.vmap(get_both_obs, in_axes=(0), out_axes=(0))
   model_tree_root = Node("", data={"type": PAST_ACTION, "action": -1}) if visualise_tree else  None
   ma_rssm = model.optimizer.model
+  #--joint_prior is NOT supported here yet, and the failure would otherwise be silent rather
+  # than loud: this walk stores both prior and posterior distributions in the same
+  # carry.stoch_state and reads them back through a shared jnp.prod(stoch[deter]) that assumes a
+  # [classes, categories] grid. A joint prior is a flat [K ** C] vector, so that product would
+  # quietly compute something meaningless instead of raising. Supporting it means separating the
+  # two uses of carry.stoch_state first. chance_marginal_eval.py and posterior_collapse_eval.py
+  # do handle the joint head.
+  assert not getattr(ma_rssm, "joint_prior", False), (
+    "dreamer_ma_evaluate does not support --joint_prior yet. Its tree walk keeps prior and "
+    "posterior distributions in one carry field and multiplies per class probabilities out of "
+    "it, which a joint prior would silently invalidate. Use chance_marginal_eval.py or "
+    "posterior_collapse_eval.py, which do support it.")
   def get_stoch_from_prediction(logits: chex.Array):
     stoch_unfiltered = np.asarray(jax.nn.softmax(logits, axis=-1))
     stoch_unnormalized = stoch_unfiltered * (stoch_unfiltered >= probability_threshold)

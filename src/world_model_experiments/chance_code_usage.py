@@ -149,8 +149,8 @@ def run_for_model(model: DreamerMA, args) -> dict:
             if dist < best_dist:
                 best_dist = dist
                 best_deter = deter
-        
-        return best_deter, combos
+        #jax.debug.breakpoint()
+        return best_deter #, combos
 
     def process_transition(recurrent, action_oh, parent_infoset, reach_prob,
                            child_state, child_terminal, child_legals, depth, history):
@@ -170,19 +170,19 @@ def run_for_model(model: DreamerMA, args) -> dict:
             out_legals = np.asarray(out_legals)
             target_obs = np.asarray(vectorized_get_obs(out_states))  # [K, players, obs_dim]
 
-            all_combos = []
+            #all_combos = []
             following = []
             for i in range(num_valid):
                 posterior_i = ma_rssm.get_encoder_no_jit(recurrent, target_obs[i])
-                best_deter_i, combos = evaluate_and_count(posterior_i, recurrent, target_obs[i], bucket)
+                best_deter_i = evaluate_and_count(posterior_i, recurrent, target_obs[i], bucket)
                 if bool(out_term[i]):
                     continue
                 child_i = jax.tree.map(lambda x: x[i], out_states)
                 inf_i = ma_rssm.get_next_infoset_all(parent_infoset, target_obs[i], action_oh)
-                all_combos.append(combos)
+                #all_combos.append(combos)
                 following.append((recurrent, best_deter_i, child_i, out_legals[i], inf_i,
                               reach_prob, depth + 1, history + f"o{i}"))
-            jax.debug.breakpoint()
+            #jax.debug.breakpoint()
             return following
 
         target_obs = np.asarray(get_both_obs(child_state))  # [players, obs_dim]

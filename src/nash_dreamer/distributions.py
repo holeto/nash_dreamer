@@ -48,6 +48,76 @@ def sample_categorical(logits: chex.Array, key, sample_threshold: float = 0.0)->
   output = jax.lax.stop_gradient(oh_sampled_classes) + (probs - jax.lax.stop_gradient(probs))
   return output
 
+"""Joint latent codes.
+
+The prior is normally `encoded_classes` INDEPENDENT categoricals, which cannot represent a
+dependency between them -- and the dynamics loss cannot see one either, since kl_divergence
+sums over the class axis. With --joint_prior the prior instead emits a single distribution over
+all `encoded_categories ** encoded_classes` joint codes. These four helpers move between the
+two representations. They are only tractable while that product is small; a large factorization
+needs an autoregressive prior instead.
+
+The index bijection throughout is the base-`encoded_categories` number whose digits are the per
+class outcomes, CLASS 0 MOST SIGNIFICANT: (0,0), (0,1), ... (0,K-1), (1,0), ... It matches
+world_model_experiments.chance_code_usage.combo_index.
+"""
+
+def factored_to_joint(probs: chex.Array, encoded_classes: int) -> chex.Array:
+  """[..., classes, categories] independent categoricals -> [..., categories ** classes] joint.
+
+  Used to express the factored POSTERIOR as a joint so it can be compared against a joint prior
+  in one KL. encoded_classes is the static config value, so this loop unrolls at trace time."""
+  joint = probs[..., 0, :]
+  for c in range(1, encoded_classes):
+    #[..., categories ** c, categories] -> [..., categories ** (c + 1)]
+    expanded = joint[..., :, None] * probs[..., c, None, :]
+    joint = expanded.reshape(*expanded.shape[:-2], -1)
+  return joint
+
+def joint_to_grid(joint_index: chex.Array, encoded_classes: int, encoded_categories: int) -> chex.Array:
+  """Flat joint code -> [..., classes, categories] one-hot grid. Inverts factored_to_joint's
+  index convention, so the grid keeps the shape every latent consumer already expects."""
+  digits = jnp.stack(
+      [(joint_index // (encoded_categories ** (encoded_classes - 1 - c))) % encoded_categories
+       for c in range(encoded_classes)], axis=-1)
+  return jax.nn.one_hot(digits, encoded_categories, axis=-1)
+
+def joint_marginals(joint_probs: chex.Array, encoded_classes: int, encoded_categories: int) -> chex.Array:
+  """[..., categories ** classes] joint -> [..., classes, categories] per class marginals.
+
+  DIAGNOSTICS AND GRADIENTS ONLY. Do not sample from these: drawing each class independently
+  from its own marginal rebuilds the outer product, which is exactly the independence a joint
+  prior exists to remove. Use sample_joint_categorical."""
+  grid = joint_probs.reshape(*joint_probs.shape[:-1], *((encoded_categories,) * encoded_classes))
+  leading = grid.ndim - encoded_classes
+  return jnp.stack(
+      [jnp.sum(grid, axis=tuple(leading + i for i in range(encoded_classes) if i != c))
+       for c in range(encoded_classes)], axis=-2)
+
+def sample_joint_categorical(logits: chex.Array, key, encoded_classes: int,
+                             encoded_categories: int, sample_threshold: float = 0.0) -> chex.Array:
+  """Sample ONE joint latent code and return it as a [..., classes, categories] one-hot grid.
+
+  The joint counterpart of sample_categorical. Sampling jointly is the entire point: the classes
+  are drawn together, so a code combination the prior has learned is impossible is never
+  produced.
+
+  sample_threshold keeps the meaning it has in the factored case -- "ignore outcomes this far
+  below a typical one" -- by rescaling with the ratio of the two uniform masses,
+  (1/K**C) / (1/K). Passing a caller's per class threshold straight through would compare it
+  against 1/K**C instead of 1/K, i.e. be wrong by a factor of K**(C-1): with the default 0.05
+  and a (2, 6) latent that is the difference between pruning nothing and pruning all but the
+  single most likely code."""
+  joint_threshold = sample_threshold / (encoded_categories ** (encoded_classes - 1))
+  sampled_joint = sample_categorical(logits, key, joint_threshold)
+  grid = joint_to_grid(jnp.argmax(sampled_joint, axis=-1), encoded_classes, encoded_categories)
+  #Straight through in the same shape as sample_categorical's: forward is the sampled grid, the
+  # gradient is the joint's per class marginal. No caller differentiates through the prior today
+  # (every imagination rollout is stop_gradient'd by its caller), but a silent zero here would be
+  # a trap for anything that later does.
+  marginals = joint_marginals(jax.nn.softmax(logits, axis=-1), encoded_classes, encoded_categories)
+  return jax.lax.stop_gradient(grid) + (marginals - jax.lax.stop_gradient(marginals))
+
 def get_normal_log_prob(mean_logits: chex.Array, value: chex.Array, use_symlog=False) ->chex.Array:
   """Get log prob of the normal distributions represented by the predictor outputs.
   Since the predictors output logits for mean and variance is assumed to be one, 
