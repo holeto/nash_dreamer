@@ -249,6 +249,20 @@ without it `rep` is 0 for the whole run. Both are intended; the startup banner s
 `freeze_posterior` is static like `two_stage_warm_up`, so the switch is a compile-time branch and
 costs one trace, not a per-step test.
 
+**Two uniform mixes.** `--uniform_mix` (0.01) is mixed into the posterior and the prior wherever a
+log of them is taken — the dynamics/representation KL and the VQ commitment term — which keeps
+those finite. The *sampled code* follows the stage instead (`DreamerMA.posterior_sample_mix`, a
+static float): `--stage_one_uniform_mix` during stage one (default −1 inherits `--uniform_mix`),
+where it is exploration for the straight-through encoder, and **no mixture in stage two**, where
+the posterior is frozen and exploration could only perturb what the decoder, the heads, `seq`, the
+`is_deter` target and imagination's start codes train on. Runs without a two-stage flag still
+sample under `--uniform_mix`, as in DreamerV3. `update_world_model` reuses the KL-mixed tensor
+whenever the two mixes agree, so runs that do not split them are bit-identical to before. Until
+2026-09-15 every stage sampled under `--uniform_mix`, so a sharp stage-two posterior still fed the
+decoder `1 − (1 − ε + ε/K)^C` off-posterior codes (≈1.7% at a (2, 6) latent). That sample passes
+no `--state_sample_threshold` either — the filter applies only in imagination and the replay
+buffer, whose sampled latent is never stored.
+
 #### `--complete_two_stage`: freeze everything but the prior
 
 The literal reading of "separate representation learning from generative learning". Stage one is

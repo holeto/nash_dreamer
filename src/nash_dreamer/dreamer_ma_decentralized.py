@@ -130,6 +130,9 @@ class DecentralizedDreamerMA(DreamerMA):
     freeze_posterior = two_stage and not two_stage_warm_up
     #--complete_two_stage additionally freezes every network but the prior in stage two.
     freeze_world_model = self.wm_config.complete_two_stage and not two_stage_warm_up
+    #Same split of the uniform mixture as the centralized model: the KL terms keep
+    # --uniform_mix, the sampled code uses posterior_sample_mix. See dreamer_ma.py.
+    sample_mix = self.posterior_sample_mix(two_stage_warm_up)
 
     def world_model_loss(ma_rssm: DecentralizedMARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -149,10 +152,19 @@ class DecentralizedDreamerMA(DreamerMA):
         stochastic_state = model.get_encoder_no_jit(recurrent_state, obs)
         if freeze_posterior:
           stochastic_state = jax.lax.stop_gradient(stochastic_state)
-        stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
+        #stochastic_state stays the --uniform_mix version the KL terms read, the code is drawn
+        # under sample_mix. Same three cases, for the same reasons, as in dreamer_ma.py.
+        posterior_logits = stochastic_state
+        stochastic_state = add_uniform_mix(posterior_logits, self.wm_config.uniform_mix)
+        if sample_mix == self.wm_config.uniform_mix:
+          sample_logits = stochastic_state
+        elif sample_mix == 0:
+          sample_logits = posterior_logits
+        else:
+          sample_logits = add_uniform_mix(posterior_logits, sample_mix)
         #Independent sample per player -- see DecentralizedMARSSM._sample_deter
         # for why this must not be a single stacked sample_categorical call.
-        deterministic_state = model._sample_deter(stochastic_state, cur_key)
+        deterministic_state = model._sample_deter(sample_logits, cur_key)
         #Cut the dynamics network's input too, or the one loss still running would keep
         # training the sequential network that produced it. See dreamer_ma.py.
         dynamics_input = jax.lax.stop_gradient(recurrent_state) if freeze_world_model else recurrent_state

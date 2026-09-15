@@ -156,6 +156,30 @@ class DreamerMA():
     unchanged and differs only in what stage two freezes."""
     return self.wm_config.hard_two_stage or self.wm_config.complete_two_stage
 
+  def posterior_sample_mix(self, in_stage_one: bool) -> float:
+    """The uniform mixture on the posterior that update_world_model draws its latent code from.
+
+    --uniform_mix has two jobs that two stage training pulls apart. Mixed into the posterior and
+    the prior wherever a log of them is taken, it keeps the KL and VQ terms finite, and those
+    always use it. Mixed into the distribution the code is SAMPLED from -- the code the decoder,
+    the reward/done/legal heads, the sequential network, the is_deter target and imagination's
+    starting points are fed -- it is exploration: it keeps the straight-through encoder visiting
+    codes its posterior would not pick. That is worth having while stage one is still choosing
+    the code, so there it is --stage_one_uniform_mix (-1 inherits --uniform_mix). Once stage one
+    ends the posterior is frozen, exploration can no longer change the code and would only
+    perturb what everything downstream trains on, so stage two samples the unmixed posterior.
+    A run with no two stage flag has no such split and keeps sampling under --uniform_mix.
+
+    Depends only on the config and the static stage flag, so the branch on it in
+    update_world_model is resolved at trace time and costs no extra trace."""
+    if not self.uses_two_stage():
+      return self.wm_config.uniform_mix
+    if not in_stage_one:
+      return 0.0
+    #A config pickled before this field existed restores it as the class default, -1.
+    stage_one_mix = self.wm_config.stage_one_uniform_mix
+    return self.wm_config.uniform_mix if stage_one_mix < 0 else stage_one_mix
+
   def frozen_network_names(self):
     """The world model networks that must not move in stage two, for whichever two stage
     variant is in effect. Empty for a run with no two stage flag; it does NOT depend on the
@@ -193,7 +217,7 @@ class DreamerMA():
   def restore_frozen_networks(self, snapshot):
     """Undo whatever the shared optimizer's momentum did to the frozen networks.
 
-    Load bearing for --soft_two_stage/--hard_two_stage, which keep the optimizer state they
+    Necessary --soft_two_stage/--hard_two_stage, which keep the optimizer state they
     have across the boundary. Under --complete_two_stage reset_optimizer_moments below has
     already removed the momentum this undoes, so there it is a guarantee that does not depend
     on reasoning about optax internals rather than the mechanism."""
@@ -316,6 +340,12 @@ class DreamerMA():
           f"loss trains the prior toward it. The {self.ac_config.wm_warm_up_period} "
           f"step warm-up then runs with imagination still off, and only after that does "
           f"the actor-critic start imagining.")
+    #Under two stage training the sampled code and the KL terms use different uniform mixtures,
+    # see posterior_sample_mix. Print both so a run's log records which ones it trained with.
+    print(f"Posterior code sampling: stage one draws the code the decoder trains on under a "
+          f"{self.posterior_sample_mix(True):g} uniform mixture (--stage_one_uniform_mix, "
+          f"exploration), stage two from the unmixed posterior. The KL terms keep --uniform_mix "
+          f"{self.wm_config.uniform_mix:g} throughout.")
 
   def update_stage_one(self, wm_loss):
     """Record this step's world model loss and end stage one once it has plateaued.
@@ -401,6 +431,9 @@ class DreamerMA():
     #--complete_two_stage freezes the rest of the world model on top of that: in stage two
     # the dynamics network is the only part of it still learning. Also static.
     freeze_world_model = self.wm_config.complete_two_stage and not two_stage_warm_up
+    #The uniform mixture the posterior CODE is drawn under, which is not necessarily the one the
+    # KL terms use. Also static; see posterior_sample_mix for why the two differ.
+    sample_mix = self.posterior_sample_mix(two_stage_warm_up)
     
     def world_model_loss(ma_rssm: MARSSM):
       l_pred, l_dyn, l_rep = 0, 0, 0
@@ -421,8 +454,21 @@ class DreamerMA():
           # trains, since recurrent_state feeds the decoder, the predictors, the dynamics net and
           # the next-recurrent call directly.
           stochastic_state = jax.lax.stop_gradient(stochastic_state)
-        stochastic_state = add_uniform_mix(stochastic_state, self.wm_config.uniform_mix)
-        deterministic_state = sample_categorical(stochastic_state, cur_key)
+        #stochastic_state stays the --uniform_mix version: it is repr_state, the posterior every KL
+        # and VQ term below takes the log of. The code itself is drawn under sample_mix, which only
+        # differs under two stage training; reusing the tensor when the two agree keeps every run
+        # that does not split them numerically identical to before.
+        posterior_logits = stochastic_state
+        stochastic_state = add_uniform_mix(posterior_logits, self.wm_config.uniform_mix)
+        if sample_mix == self.wm_config.uniform_mix:
+          sample_logits = stochastic_state
+        elif sample_mix == 0:
+          #Not add_uniform_mix(logits, 0): its log(probs) underflows to -inf for a sharp posterior,
+          # which would NaN the straight-through gradient of an unmixed stage one.
+          sample_logits = posterior_logits
+        else:
+          sample_logits = add_uniform_mix(posterior_logits, sample_mix)
+        deterministic_state = sample_categorical(sample_logits, cur_key)
         #With the world model frozen the dynamics network is the only one left to train, so
         # its input must be cut too -- otherwise the dynamics loss would keep training the
         # sequential network that produced recurrent_state, and through it everything upstream.
@@ -656,6 +702,7 @@ class DreamerMA():
     self.learner_steps += 1
     if in_stage_one:
       self.update_stage_one(wm_loss)
+    
 
   def train_model(self, model_save_dir:str, num_steps:int, print_each: int = -1, 
                   save_each: int = -1,

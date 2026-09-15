@@ -401,7 +401,6 @@ class ReplayBuffer():
       self.online_trajectories_accumulator -= 1.0
     online_traj = self.online_trajectories + extra
     replayed_traj = self.batch_size - online_traj
-
     if online_traj == 0:
       return self.sample_batch(replayed_traj)
     elif replayed_traj == 0:
@@ -661,8 +660,10 @@ class WMReplayBuffer(ReplayBuffer):
     if all([net is not None for net in (recurrent_network, encoder_network, observer_network,infoset_network, actor_network)]):
       batch_trajectories = self.sample_batch_trajectories(recurrent_network, encoder_network, observer_network, infoset_network, actor_network, batch_size, sample_key)
     else:
+      #The code works here
       assert self.cached_sample is not None, "The variant of add_batch where one or more of the networks are unset was called, but cached_sample is not set. Please call cache_sampling first."
       batch_trajectories = self.cached_sample(batch_size, sample_key)
+    #The code does not get here
     self.store_batch(batch_trajectories)
     return batch_trajectories
   

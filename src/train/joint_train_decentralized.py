@@ -51,6 +51,7 @@ def train_nash_dreamer_decentralized(args, game: JaxGame):
 
       free_bits_clip_threshold = args.free_bits_threshold,
       uniform_mix = args.uniform_mix,
+      stage_one_uniform_mix = args.stage_one_uniform_mix,
 
       encoded_classes = args.encoded_classes,
       encoded_categories = args.encoded_categories,

@@ -402,8 +402,17 @@ class DreamerMAConfig():
   stage_one_max_steps: int = -1 #Hard cap on stage one, -1 for no cap.
 
   free_bits_clip_threshold: float = 1 #Threshold for loss clip in free bits.
-  uniform_mix: float = 0.01 # Amount of uniform mixture added to the 
-                            # network produced categoricals. 
+  #Two uniform mixtures, because two stage training pulls apart the two jobs one used to do.
+  # uniform_mix is mixed into the posterior and the prior wherever a log of them is taken -- the
+  # dynamics/representation KL and the VQ-VAE commitment term -- which keeps those finite. The
+  # posterior CODE is sampled under a mixture that follows the stage instead (see
+  # DreamerMA.posterior_sample_mix): without a two stage flag it is uniform_mix, as in DreamerV3;
+  # during stage one it is stage_one_uniform_mix, exploration for the straight-through encoder
+  # while it still chooses its code; in stage two there is none, since the posterior is frozen
+  # and exploration could only perturb what the decoder, the heads, the sequential network and
+  # imagination's starting codes train on. Before 2026-09-15 every stage sampled under uniform_mix.
+  uniform_mix: float = 0.01 #Mixture used wherever a log of the posterior or the prior is taken.
+  stage_one_uniform_mix: float = -1 #Mixture the stage one code is sampled under, -1 inherits uniform_mix.
   
   bin_range: int = 20 #Number of the exponentially spaced bins for certain predictions such as reward in one direction, bins will be spaced out as symexp([-bin_range, ..., bin_range])
   
