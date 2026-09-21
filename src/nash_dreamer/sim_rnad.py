@@ -293,7 +293,7 @@ class ACNetwork(nnx.Module):
   
   def get_policy_both_no_jit(self, joint_obs, joint_legal, use_symlog=True) ->chex.Array:
     if use_symlog:
-      joint_legal = symlog(joint_obs)
+      joint_obs = symlog(joint_obs)
     vectorized_actor = nnx.vmap(MARSSM.call_net, in_axes=(None, 0, 0), out_axes=0)
     return vectorized_actor(self.actor, joint_obs, joint_legal)[0]
       

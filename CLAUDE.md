@@ -644,6 +644,31 @@ alternatives below for an actual exploitability number.
 `src/eval/goofspiel_nash.pkl` and `leduc_nash.pkl` are reference equilibria for the `nash` subcommand.
 Everything under `metrics/`, `precomputed_metrics/`, `world_model_metrics/` is generated output.
 
+#### The eval path symlogs real infosets, as of 2026-09-21 — older metrics do not
+
+Every learner symlogs a **real** infoset before the actor sees it (`rnad_dreamer.py`,
+`mmd_dreamer.py`, `dreamer_actor_critic.py`, `sim_rnad.py`, `sim_mmd.py`), and so does trajectory
+collection (`replay_buffer.py`). Latent infosets are passed through untouched. Until 2026-09-21
+`policy_eval_utils.py` imported `symlog` and never called it, so **every NashConv number stored
+before that date — NashDreamer *and* the `SimRNaD`/`SimMMD` baselines — scored a policy that was
+never trained and never acted.** On a binary infoset `symlog` rescales every 1 to `log(2) = 0.6931`,
+and an MLP with biases is not invariant to that.
+
+The fix is `vectorized_actor_policy` / `actor_input_uses_symlog`, used by **both** actor call sites:
+`extract_model_policy` and `model_best_response`. Note `nash_conv` reaches the actor only through the
+latter — patching `extract_model_policy` alone leaves the metric wrong.
+
+The gate is `use_real_infoset`, **not** `obs_loss_bce`, which is what `MARSSM.get_policy` gates its
+own symlog on. The two coincide on the checkpoints tested so far but are different quantities; the
+`get_policy` condition is a separate open issue, as is `sim_rnad.py:296`, which assigns
+`joint_legal = symlog(joint_obs)` and so overwrites the legal mask instead of the observation.
+
+`actor_critic_evaluate.py --raw_infoset_eval` restores the pre-fix behaviour. Use it to reproduce a
+stored number, and **do not mix the two conventions on one plot**. Measured on Leduc at seed 513 /
+step 7000 the readout moves a policy by 0.011–0.033 mean `linf` depending on the run, up to 0.166 —
+small against the between-run differences it is used to compare, but not negligible at the
+highest-reach nodes.
+
 ### Exact exploitability for Phantom TTT (`src/eval/pttt_exploitability/`)
 
 Not a scaled-up version of the tree walk above — a three-stage bridge to `eas` ("exp-a-spiel"), an

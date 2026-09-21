@@ -22,7 +22,40 @@ from nash_dreamer.sim_mmd import SimMMD
 from nash_dreamer.sim_ppo import SimPPO
 from nash_dreamer.ma_rssm import MARSSM
 
-def extract_model_policy(model: DreamerMA|SimRNaD|SimMMD|SimPPO|None, game: JaxGame | DreamerModelGame, uniform=False)-> tuple[list, list]:
+
+def actor_input_uses_symlog(model: DreamerMA|SimRNaD|SimMMD|SimPPO) -> bool:
+  """Whether this model's actor was trained on symlog'd inputs.
+
+  Every learner symlogs REAL infosets before the actor sees them -- rnad_dreamer.py,
+  mmd_dreamer.py, dreamer_actor_critic.py, sim_rnad.py, sim_mmd.py -- and so does trajectory
+  collection in replay_buffer.py. Latent infosets are passed through untouched. Evaluation has
+  to use the same convention or it scores a policy the learner never optimized and never acted
+  with: on a binary infoset symlog rescales every 1 to log(2) = 0.6931, and an MLP with biases
+  is not invariant to that.
+
+  SimRNaD/SimMMD/SimPPO wrap an ACNetwork, which has no use_real_infoset attribute and is always
+  fed the real infoset, hence the default.
+
+  Deliberately NOT obs_loss_bce, which is what MARSSM.get_policy gates on -- the two conditions
+  coincide on some checkpoints but are different quantities."""
+  return getattr(model.optimizer.model, "use_real_infoset", True)
+
+
+def vectorized_actor_policy(model: DreamerMA|SimRNaD|SimMMD|SimPPO, use_symlog: bool | None = None):
+  """The actor's behavioral policy over [Pl, I, ...] infoset/legal batches, in the input
+  convention the model was trained under. Returns a callable (infosets, legals) -> pi.
+  use_symlog overrides the auto-detection; pass False to reproduce metrics stored before this
+  was fixed."""
+  if use_symlog is None:
+    use_symlog = actor_input_uses_symlog(model)
+  net = MARSSM.vmap_over_net(model.optimizer.model.actor, in_axes=[(0, 0), (0, 0)], out_axes=[0, 0])
+  if use_symlog:
+    return lambda infosets, legals: net(symlog(infosets), legals)[0]
+  return lambda infosets, legals: net(infosets, legals)[0]
+
+
+def extract_model_policy(model: DreamerMA|SimRNaD|SimMMD|SimPPO|None, game: JaxGame | DreamerModelGame, uniform=False,
+                         use_symlog: bool | None = None)-> tuple[list, list]:
   """Extracts policies for the whole game from the RNaD model and 
   returns them as per depth
   infoset map and behavioral policies. Can also instead
@@ -41,8 +74,7 @@ def extract_model_policy(model: DreamerMA|SimRNaD|SimMMD|SimPPO|None, game: JaxG
   if uniform or not model:
     vectorized_get_policy = jax.vmap(jax.vmap(uniform_policy, in_axes=(0, 0), out_axes=0), in_axes=(0, 0), out_axes=0)
   else:
-    vectorized_net = MARSSM.vmap_over_net(model.optimizer.model.actor, in_axes=[(0, 0), (0, 0)], out_axes=[0, 0])
-    vectorized_get_policy = lambda x, y : vectorized_net(x, y)[0]
+    vectorized_get_policy = vectorized_actor_policy(model, use_symlog)
   def _tree_walk(game_states: GameState, legals_non_padded: jax.Array, depth=0):
      # Denoting this as A(D)
     max_actions = max(game.depth_chance_outcomes(depth), game_actions)
@@ -250,7 +282,8 @@ def compare_policies(game: JaxGame| DreamerModelGame, given_pols: tuple[list, li
   _tree_walk(init_state)
        
 
-def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None):
+def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None,
+                        use_symlog: bool | None = None):
   """Compute counterfactual best response policies for both players and their 
   respective values.Returned as br value of p2 against p1
   , br value of p1 against p2, p1_br_policy, p2_br_policy.
@@ -282,10 +315,8 @@ def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: Ja
   vectorized_is_chance = jax.vmap(game.is_chance, in_axes=0, out_axes=0)
   vectorized_chance_info = jax.vmap(game.get_outcomes_and_probs, in_axes=0, out_axes=(0, 0))
   if checking_model:
-    ma_rssm = model.optimizer.model
     #vmap over the H(D) dimension first and then over the player dimension
-    vectorized_get_policy = MARSSM.vmap_over_net(ma_rssm.actor, in_axes=[(0, 0), (0, 0)], out_axes=[0, 0])
-    
+    vectorized_get_policy = vectorized_actor_policy(model, use_symlog)
 
   else:
     """TODO: Think on how to vectorize it"""
@@ -342,7 +373,7 @@ def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: Ja
     p1_legal, p2_legal = legals[0], legals[1]
     legal = p1_legal[..., None] * p2_legal[..., None, :]
 
-    pi = vectorized_get_policy(curr_infoset, legals_non_padded)[0] if checking_model else vectorized_get_policy(depth, curr_infoset, legals_non_padded)
+    pi = vectorized_get_policy(curr_infoset, legals_non_padded) if checking_model else vectorized_get_policy(depth, curr_infoset, legals_non_padded)
     #jax.debug.breakpoint()
     #[Pl, H(D), A(D)]
     pi = np.pad(pi, ((0, 0), (0, 0), (0, max_actions - pi.shape[-1])), constant_values=0)
@@ -470,7 +501,8 @@ def model_best_response(model: DreamerMA| SimRNaD| SimMMD| SimPPO|None, game: Ja
   return state_value[1], state_value[0], p1_br, p2_br
 
 
-def nash_conv(model: DreamerMA, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None):
+def nash_conv(model: DreamerMA, game: JaxGame | DreamerModelGame, custom_policy: tuple[list, list] = None,
+              use_symlog: bool | None = None):
   """Computes NashConv of the model, or the given policy
 
   Args:
@@ -479,8 +511,12 @@ def nash_conv(model: DreamerMA, game: JaxGame | DreamerModelGame, custom_policy:
       custom_policy (tuple[list, list], optional): An already extracted policy, represented
       as (per depth infoset map, per depth infoset behaviorals). If it is supplied, will compute
        NashConv of this policy rather than extracting it from the model. Defaults to None.
+      use_symlog (bool, optional): Input convention for the actor. Defaults to None, which
+       auto-detects it from the model the way training does -- see actor_input_uses_symlog.
+       Pass False to reproduce metrics stored before that was fixed.
   """
-  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game, custom_policy=custom_policy)
+  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game, custom_policy=custom_policy,
+                                                          use_symlog=use_symlog)
   return p1_br_val + p2_br_val
 
 

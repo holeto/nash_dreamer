@@ -15,6 +15,10 @@ parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name a
 parser.add_argument("--seeds", type=str, default='(42, )', help="Seeds of the stored models to check. Supplied as a string (seed_1, seed_2, ..., seed_n)")
 parser.add_argument("--restore_step", type=int, default=10000, help="Saved step of the model to restore. If checking entire directory, -1 is also supported for all steps")
 
+parser.add_argument("--raw_infoset_eval", action="store_true", help="Feed the actor RAW infosets instead of symlog'd ones, reproducing the behaviour of every metric stored before "
+                    "2026-09-21. Every learner symlogs real infosets before the actor sees them (and so does trajectory collection), but this evaluation path did not, so it scored a "
+                    "policy that was never trained or acted. The default now matches training; pass this flag only to reproduce a historical number.")
+
 parser.add_argument("--scale_factor", type=float, default=1.0, help="Scale factor to multiply all rewards by. Useful if the game implementation scaled rewards in a different way than traditional implementations."
                     "Then, this should be the inverse of the game scaling factor. For example, JaxLeduc divides all rewards by 13, so to get values appriopriately scaled as in literature, this should be set to 13.")
 
@@ -118,11 +122,14 @@ def get_metrics_from_dir(model_dir, args):
                 game = InformedRealGame(model)
 
         # Calculate Metric
+        #None auto-detects the input convention from the model, matching what training used.
+        # False is the pre-fix behaviour, kept so stored metrics stay reproducible.
+        use_symlog = False if args.raw_infoset_eval else None
         if args.metric == "nash_conv":
-            metric = nash_conv(model, game)
+            metric = nash_conv(model, game, use_symlog=use_symlog)
             #jax.debug.breakpoint()
         else:
-            model_map_and_behaviorals = extract_model_policy(model, game)
+            model_map_and_behaviorals = extract_model_policy(model, game, use_symlog=use_symlog)
             metric, _ = policy_expected_value(game, model_map_and_behaviorals)
         
         metric = args.scale_factor * metric
@@ -375,7 +382,8 @@ def test_nash(args, saved_nash_path: str):
   game = InformedRealGame(model) if (isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset) else model.game
   p1_nash_val, p2_nash_val, nash_infoset_map, nash_behaviorals = load_model(nash_path)
   print(f"Loaded nash policies of game with game value {p1_nash_val} (from player 1 perspective)")
-  model_map, model_behaviorals = extract_model_policy(model, game)
+  use_symlog = False if args.raw_infoset_eval else None
+  model_map, model_behaviorals = extract_model_policy(model, game, use_symlog=use_symlog)
   found_p1_nash, found_p2_nash = policy_expected_value(game, (nash_infoset_map, nash_behaviorals), eps=1e-5)
   found_p1_nash, found_p2_nash = args.scale_factor * found_p1_nash, args.scale_factor * found_p2_nash
   print(f"Found nash values: {found_p1_nash} {found_p2_nash}")
@@ -388,7 +396,7 @@ def test_nash(args, saved_nash_path: str):
   model_p1_val, model_p2_val = policy_expected_value(game, (model_map, model_behaviorals))
   model_p1_val, model_p2_val = args.scale_factor * model_p1_val, args.scale_factor * model_p2_val
   print(f"Model values {model_p1_val}, {model_p2_val}")
-  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game)
+  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game, use_symlog=use_symlog)
   p1_br_val, p2_br_val = args.scale_factor * p1_br_val, args.scale_factor * p2_br_val
   print(f"P2 best response value against p1: {p2_br_val}")
   print(f"P1 best response value against p2 {p1_br_val}")
