@@ -288,6 +288,7 @@ class DecentralizedDreamerMA(DreamerMA):
         grad_norms[k] = optax.tree.norm(grad[k], ord=2)
 
     loss, (pred_step, metrics) = func_data
-    optimizer.update(grad)
+    #Returned rather than applied, exactly as in the centralized version: the inherited
+    # DreamerMA.train_step folds it into the actor-critic's single optimizer step.
 
-    return loss, pred_step, metrics, grad_norms
+    return loss, pred_step, metrics, grad_norms, grad

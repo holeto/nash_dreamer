@@ -140,6 +140,7 @@ class DreamerActorCritic():
     wm_prediction_step: PredictionStepWithLegal,
     return_range: chex.Array,
     imagine: bool,
+    wm_grad,
   ):
     """Compute RNaD loss and use it to perform
     a gradient step of both RNaD and Dreamer."""
@@ -246,7 +247,6 @@ class DreamerActorCritic():
         self.config.beta_imagination)
       
       img_loss, (new_range, img_metrics) = img_return
-      optimizer.update(igrad)       
     else:
       img_loss, new_range = 0.0, return_range
       img_metrics = {k: 0 for k in self.metrics_keys[:2]}
@@ -259,7 +259,17 @@ class DreamerActorCritic():
       self.config.beta_real
     )
     r_loss, (new_range, r_metrics) = r_return
-    optimizer.update(rgrad)
+    #One step on the mean of the imagination and real gradients, instead of one step on each
+    # with the model moving in between. The two losses are still differentiated separately, so
+    # --report_gradnorms can still tell their contributions apart; by linearity that is identical
+    # to differentiating their mean. `imagine` is a static jit argument, so this is a compile-time
+    # branch -- and the else-branch igrad is a dict of plain zeros with no pytree structure
+    # matching rgrad, so it must never reach jax.tree.map.
+    combined_grad = jax.tree.map(lambda i, r: (i + r) / 2, igrad, rgrad) if imagine else rgrad
+    #Fold in the world model gradient DreamerMA computed for this learner step, so the whole
+    # learner step is a single optimizer step on the compound loss (see DreamerMA.train_step).
+    combined_grad = jax.tree.map(jnp.add, combined_grad, wm_grad)
+    optimizer.update(combined_grad)
 
     grad_norms = self.grad_norms.copy()
     if self.config.report_gradnorms:
@@ -284,11 +294,11 @@ class DreamerActorCritic():
 
   
   def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array,
-           should_imagine: bool):
+           should_imagine: bool, wm_grad):
     #REINFORCE used to imagine from step 0 unconditionally -- it was the one learner with no
     # warm-up gate at all. It now honours the same boundary as RNaD and MMD, decided centrally
     # by DreamerMA.
-    loss, self.return_range, self.metrics, self.grad_norms =  self.update_paramaters_and_model(self.optimizer, self.target_optimizer, trajectory_key, wm_timestep, wm_prediction_step, self.return_range, should_imagine)
+    loss, self.return_range, self.metrics, self.grad_norms =  self.update_paramaters_and_model(self.optimizer, self.target_optimizer, trajectory_key, wm_timestep, wm_prediction_step, self.return_range, should_imagine, wm_grad)
     self.learner_steps += 1
   
   def getstate(self):

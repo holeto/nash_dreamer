@@ -388,6 +388,13 @@ class DreamerMAConfig():
   #    Pass --free_bits_threshold 0 if that is a risk for the latent size in use.
   complete_two_stage: bool = False #Stage two trains ONLY the prior and the actor-critic.
 
+  #Freeze the ENTIRE world model for the whole run, so only the actor-critic learns. Not a
+  # CLI flag: it is set on a checkpoint whose world model was snapshotted from another run
+  # (src/debug/collapsed_wm_reinit.py), and --continue_train restores the stored config, so
+  # the stored field is what decides. The world model losses are still computed, since the
+  # actor-critic consumes their prediction step, and still printed -- read them as fixed.
+  frozen_world_model: bool = False
+
   #Stage one ends when the world model's compound loss has plateaued, NOT after a fixed
   # number of steps. The last loss_check_window losses are kept in a ring buffer; once it
   # is full, a least squares line is fitted and stage one ends when the total drop that

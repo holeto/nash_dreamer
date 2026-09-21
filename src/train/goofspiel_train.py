@@ -16,7 +16,7 @@ parser.add_argument("--observation_only", action="store_true", help="Use per-tur
 def main():
   args = parser.parse_args()
   if args.random:
-    game = JaxRandomGoofspiel(cards=args.num_cards)
+    game = JaxRandomGoofspiel(cards=args.num_cards, observation_only=args.observation_only)
   else:
     game = JaxGoofspiel(cards=args.num_cards, observation_only=args.observation_only)
   if args.experiment_type == 'nash_dreamer':

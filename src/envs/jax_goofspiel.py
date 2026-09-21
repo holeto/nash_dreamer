@@ -169,7 +169,7 @@ class GoofspielRandomGameState(GameState):
     is_chance: chex.Array
 
 class JaxRandomGoofspiel(JaxGame):
-  def __init__(self, cards, reward_type: str = "clip") -> None:
+  def __init__(self, cards, reward_type: str = "clip", observation_only=False) -> None:
     """A classic variant of Goofspiel, where the point cards are actually dealt via a chance node.
     And are fully observable. Strategically, it is not harder than the descending variant, but
     it is much larger game.
@@ -177,6 +177,7 @@ class JaxRandomGoofspiel(JaxGame):
     self.cards = cards
     self.max_turns = cards
     self.reward_type = 0 if reward_type == "clip" else 1
+    self.observation_only = observation_only
     
   
   def game_name(self):
@@ -185,7 +186,10 @@ class JaxRandomGoofspiel(JaxGame):
   def params_dict(self):
     #Possible to also add other relevant information
     # for now just the cards will do to organize into subdirs
-    return {"num_cards" : self.cards}
+    d = {"num_cards": self.cards}
+    if self.observation_only:
+      d["observation_only"] = "obs"
+    return d
   
   def information_type(self):
     return InformationType.IIG
@@ -199,8 +203,9 @@ class JaxRandomGoofspiel(JaxGame):
   def information_state_tensor_shape(self):
     return self.max_turns * self.cards + self.max_turns * 2 + self.max_turns * self.cards * 2 + 2
   
-  # TODO: Change this
   def observation_tensor_shape(self):
+    if self.observation_only:
+      return self.cards + 4
     return self.information_state_tensor_shape()
   
   def public_state_tensor_shape(self):
@@ -278,18 +283,31 @@ class JaxRandomGoofspiel(JaxGame):
 
     p1_player = jax.nn.one_hot(0, 2)
 
-    p1_infoset_tensor = jnp.concatenate([p1_player, public_state_tensor, jnp.ravel(game_state.played_cards[0])], axis=0)
-    p2_infoset_tensor = jnp.concatenate([1 - p1_player, public_state_tensor, jnp.ravel(game_state.played_cards[1])], axis=0)
-
     state_tensor = jnp.concatenate([public_state_tensor, jnp.ravel(game_state.played_cards)], axis=0)
+    if self.observation_only:
+      # point_cards is already one-hot per turn (set at the chance node), so use it directly.
+      oh_current_point = game_state.point_cards[game_state.turn]
+      prev_idx = jnp.maximum(game_state.turn - 1, 0)
+      prev_points = game_state.p1_points[prev_idx]
+      p2_won = jnp.where(prev_points < 0, 1, 0) - (prev_points == 0)
+      prev_winner = jax.nn.one_hot(p2_won, 2)
+      #Replace the public state tensor and the infoset
+      # tensors with public/private observations
+      public_info = jnp.concatenate([oh_current_point, prev_winner], axis=0)
+      p1_info = jnp.concatenate([p1_player, public_info], axis=0)
+      p2_info = jnp.concatenate([1 - p1_player, public_info], axis=0)
+    else:
+      public_info = public_state_tensor
+      p1_info = jnp.concatenate([p1_player, public_info, game_state.played_cards[0].ravel()], axis=0)
+      p2_info = jnp.concatenate([1 - p1_player, public_info, game_state.played_cards[1].ravel()], axis=0)
 
     # Zero out tensors at chance nodes
     state_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(state_tensor), state_tensor)
-    p1_infoset_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(p1_infoset_tensor), p1_infoset_tensor)
-    p2_infoset_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(p2_infoset_tensor), p2_infoset_tensor)
-    public_state_tensor = jnp.where(game_state.is_chance, jnp.zeros_like(public_state_tensor), public_state_tensor)
+    p1_info = jnp.where(game_state.is_chance, jnp.zeros_like(p1_info), p1_info)
+    p2_info = jnp.where(game_state.is_chance, jnp.zeros_like(p2_info), p2_info)
+    public_info = jnp.where(game_state.is_chance, jnp.zeros_like(public_info), public_info)
 
-    return state_tensor, p1_infoset_tensor, p2_infoset_tensor, public_state_tensor
+    return state_tensor, p1_info, p2_info, public_info
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def apply_action(self, game_state:GoofspielRandomGameState, actions):

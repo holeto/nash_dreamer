@@ -13,6 +13,7 @@ parser.add_argument("--metric", type=str, default="nash_conv", choices=("nash_co
 parser.add_argument("--algos", type=str, default="NashDreamer RNaD", help="Which algorithms to plot.")
 parser.add_argument("--log_x", action="store_true", help="Plot x-axis in log scale.")
 parser.add_argument("--log_y", action="store_true", help="Plot y-axis in log scale.")
+parser.add_argument("--x_label", type=str, default="Env steps", help="Label of the x-axis. Sometimes we might wish to plot in gradient steps.")
 parser.add_argument("--divide_by", type=float, default=1.0, help="Divide all metric values (and the uniform-policy baseline) by this constant before plotting.")
 parser.add_argument("--skip_divide", type=str, default="", help="Space-separated subset of --algos entries to exclude from --divide_by (e.g. baselines that are already normalized).")
 parser.add_argument("--no_warmup_line", action="store_true", help="Don't plot the WM warm-up vertical line (useful when the warm-up length itself is the thing being ablated).")
@@ -171,7 +172,7 @@ def plot_comparison(args):
 
     render_plot(results, algo_strs, algo_names, game_str, smoothing_window,
                 uniform_nash_conv, uniform_nash_conv_divisor, algo_warmup_steps,
-                max_steps, args, skip_first_checkpoint=args.skip_first_checkpoint)
+            max_steps, args, x_label=args.x_label,skip_first_checkpoint=args.skip_first_checkpoint)
 
 
 def render_plot(results, algo_strs, algo_names, game_str, smoothing_window,

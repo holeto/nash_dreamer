@@ -92,7 +92,8 @@ class MMDDreamer():
     trajectory_key,
     wm_timestep: TimeStep,
     wm_prediction_step: PredictionStepWithLegal,
-    imagine: bool
+    imagine: bool,
+    wm_grad
   ):
     """Compute the MMD loss and use it to perform a gradient step of both
     the actor-critic and the Dreamer networks."""
@@ -220,7 +221,7 @@ class MMDDreamer():
 
     summed_metrics = None
     igrad = {k: 0 for k in self.network_keys}
-    for _ in range(self.num_epochs):
+    for epoch in range(self.num_epochs):
       epoch_metrics = {}
       if imagine:
         img_return, igrad = nnx.value_and_grad(imagination_loss, argnums=(0), has_aux=True)(
@@ -230,7 +231,6 @@ class MMDDreamer():
           img_advantage,
           self.config.beta_imagination)
         _, img_metrics = img_return
-        optimizer.update(igrad)
         epoch_metrics.update(img_metrics)
       else:
         epoch_metrics.update({'img_val': 0, 'img_policy': 0, 'kl_old': 0, 'magnet': 0, 'clip_frac': 0})
@@ -242,7 +242,21 @@ class MMDDreamer():
         real_advantage,
         self.config.beta_real)
       _, r_metrics = r_return
-      optimizer.update(rgrad)
+      #One step on the mean of the imagination and real gradients, instead of one step on each
+      # with the model moving in between. The two losses are still differentiated separately, so
+      # --report_gradnorms can still tell their contributions apart; by linearity that is identical
+      # to differentiating their mean. `imagine` is a static jit argument, so this is a compile-time
+      # branch -- and the else-branch igrad is a dict of plain zeros with no pytree structure
+      # matching rgrad, so it must never reach jax.tree.map.
+      combined_grad = jax.tree.map(lambda i, r: (i + r) / 2, igrad, rgrad) if imagine else rgrad
+      #The world model gradient DreamerMA computed for this learner step rides on the FIRST
+      # epoch's update, so with num_epochs == 1 the learner step is a single optimizer step on
+      # the compound loss (see DreamerMA.train_step). Further epochs step the actor-critic
+      # alone; the world model then drifts on its momentum during them, which is inherent to
+      # taking several steps per batch through one shared optimizer.
+      if epoch == 0:
+        combined_grad = jax.tree.map(jnp.add, combined_grad, wm_grad)
+      optimizer.update(combined_grad)
       epoch_metrics.update(r_metrics)
 
       summed_metrics = epoch_metrics if summed_metrics is None else jax.tree.map(jnp.add, summed_metrics, epoch_metrics)
@@ -273,17 +287,17 @@ class MMDDreamer():
 
 
   def step(self, wm_timestep: TimeStep, wm_prediction_step:PredictionStepWithLegal, trajectory_key: chex.Array,
-           should_imagine: bool):
+           should_imagine: bool, wm_grad):
     #should_imagine is decided by DreamerMA, which is the only thing that knows where stage
     # one ended and therefore where the warm-up after it ends. This learner's own
     # learner_steps cannot answer that: a hard stage one leaves the counter behind, and a
     # soft one lets it run ahead through stage one.
     self.metrics, self.grad_norms = self.update_parameters_and_model(self.optimizer, self.target_optimizer,
                                                                     trajectory_key, wm_timestep, wm_prediction_step,
-                                                                    should_imagine)
+                                                                    should_imagine, wm_grad)
     self.learner_steps += 1
-    #Each inner epoch takes one imagined and one real gradient step
-    self.gradient_steps += 2 * self.num_epochs
+    #Each inner epoch takes one optimizer step, on the mean of its imagined and real gradients
+    self.gradient_steps += self.num_epochs
 
   def getstate(self):
       return {'learner_steps': self.learner_steps,

@@ -105,6 +105,7 @@ def run_for_model(model: DreamerMA, args) -> dict:
     usage counts. Returns the aggregate result dict."""
     ma_rssm = model.optimizer.model
     game = model.game
+    jax.debug.breakpoint()
     use_real_infoset = model.use_real_infoset
     num_players = game.num_players()
     num_actions = game.num_distinct_actions()

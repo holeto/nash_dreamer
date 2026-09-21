@@ -161,9 +161,10 @@ exactly one thing: `game.to_compact_str()` as the directory name.
 
 - **NashDreamer** (`DreamerMA`) = an `MARSSM` world model + an actor-critic head, chosen by config type
   in `nash_dreamer/dreamer_ma.py::init`: `MMDConfig` → `MMDDreamer`, else `use_rnad` → `RNaDDreamer`,
-  else `DreamerActorCritic` (REINFORCE). One `train_step` = sample the buffer, update the world model,
-  then step the actor-critic on *both* real and imagined trajectories (`--beta_real` /
-  `--beta_imagination`).
+  else `DreamerActorCritic` (REINFORCE). One `train_step` = sample the buffer, differentiate the world
+  model loss, then differentiate the actor-critic loss on *both* real and imagined trajectories
+  (`--beta_real` / `--beta_imagination`) and take **one** optimizer step on the sum (see "One
+  optimizer step per learner step" below).
 - **`SimRNaD`** / **`SimMMD`** (`nash_dreamer/sim_rnad.py`, `nash_dreamer/sim_mmd.py`) are standalone
   baselines: no world model, the actor reads the game's real infoset tensor directly. `MMDDreamer` and
   `SimMMD` share one `MMDConfig` — the Dreamer-only fields (`beta_imagination`, `wm_warm_up_period`,
@@ -279,11 +280,10 @@ the actor-critic keep training. Three mechanisms, and **all three are needed**:
    input is `recurrent_state` — without this it would keep training `seq`, and through it everything
    upstream.
 3. **Restore the frozen parameters after each `train_step`.** A zero gradient is *not* enough:
-   `DreamerMA.optimizer` is one optimizer shared by the world-model and actor-critic updates, and
-   LaProp carries momentum across both, so a network that stops receiving gradient still drifts on
-   leftover momentum. Measured on goofspiel_3 that tail is ~2.5e-5 max |Δw| over the first ten steps
+   `DreamerMA.optimizer` is one optimizer over every network, and LaProp carries momentum from step
+   to step, so a network that stops receiving gradient still drifts on leftover momentum. Measured on goofspiel_3 that tail is ~2.5e-5 max |Δw| over the first ten steps
    past the boundary, decaying geometrically (3e-6, 2e-7, 7e-10) — small, but not frozen.
-   `snapshot_frozen_networks`/`restore_frozen_networks` rebind the arrays around both updates, which
+   `snapshot_frozen_networks`/`restore_frozen_networks` rebind the arrays around the update, which
    is what `optimizer.update` itself does and costs no device work. With it the frozen networks are
    **bit-identical** across 80 steps while `dyn`, `actor` and `critic` keep moving.
 
@@ -322,12 +322,40 @@ Not reset, deliberately: the **LR schedule's own count** (restarting it would re
 and `nnx.Optimizer.step` (nothing reads it). `reset_optimizer_moments` asserts the chain layout
 so a change to `make_opt` fails loudly rather than silently zeroing the schedule.
 
-One global worth knowing about while reading any of these counters: **`optimizer.update` is
-called once per world-model step, once by the actor-critic's real loss and once more by its
-imagination loss**, so the shared counters advance at **1x** during a hard/complete stage one,
-**2x** during the warm-up and **3x** afterwards. The LR schedule is therefore keyed to a rate
-that changes at every phase boundary — `--wm_warm_up`-scale numbers in `OptimizerConfig` are not
-in learner steps.
+#### One optimizer step per learner step
+
+`DreamerMA.optimizer` wraps the whole `MARSSM`, actor and critic included, so its four scalar
+counters — the `_scale_by_rms` and `_scale_by_momentum` bias-correction steps, the
+`scale_by_learning_rate` schedule count (`OptimizerConfig.warmup`/`anneal`), and
+`nnx.Optimizer.step` — are **shared by every parameter**. Since 2026-09-18 `update_world_model`
+returns its gradient instead of applying it, and each actor-critic learner adds it (`wm_grad`) into
+its own single `optimizer.update`, so one learner step is one optimizer step on the compound loss
+and the counters advance at **1x** throughout. When a hard/complete stage one skips the
+actor-critic, `DreamerMA.apply_gradient` applies the world-model gradient alone. `MMDDreamer`
+folds it into its **first** inner epoch only, so its rate is `num_epochs` and is exactly one step
+at `num_epochs == 1`.
+
+Before 2026-09-18 the world model and the actor-critic each called `optimizer.update`, and that is
+**not** equivalent to one step on the sum even though their parameters are disjoint:
+
+- **Ghost momentum step.** In the other half's update each network gets an exactly zero gradient,
+  but LaProp still moves it by `lr·mu_hat/√nu_hat` on leftover momentum. Measured on goofspiel_3 the
+  actor/critic moved **0.86–0.89x** of a real step during every world-model update, and `nu`
+  averaging in the zeros inflated real steps by up to √2. Replaying the same actor-critic gradient
+  stream through LaProp, the two-update scheme travelled **1.27x** further over 300 steps with
+  `--warmup 0`.
+- **2x counters.** The LR warm-up finished at learner step 500 instead of 1000 (2.9x further
+  travel after 40 steps with the default warm-up), and bias correction followed a different schedule.
+
+So a pre-fix NashDreamer run is **not** comparable to a `SimRNaD`/`SimMMD` run, even with imagination
+off. With the fix and imagination off, the actor/critic trajectory is bit-identical to a fresh LaProp
+taking one update per step on the same gradients. One semantic change came with it: imagination
+now rolls out the world model from **before** this step's update, as in DreamerV3, rather than
+after it.
+
+Rate history, for `OptimizerConfig` schedules tuned against old runs: before 2026-09-17 the actor-critic
+also stepped separately on the imagination and real gradients (3x in the full phase, `1 + 2·num_epochs`
+for MMD). From 2026-09-17 to 2026-09-18 it was 2x everywhere except a hard/complete stage one (1x).
 
 One hazard: the free-bits clamp still applies to `dyn`, so if the dynamics loss sits below
 `--free_bits_threshold` the world model stops learning **altogether** in stage two — `dyn` is the
