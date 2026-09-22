@@ -15,6 +15,8 @@ parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name a
 parser.add_argument("--seeds", type=str, default='(42, )', help="Seeds of the stored models to check. Supplied as a string (seed_1, seed_2, ..., seed_n)")
 parser.add_argument("--restore_step", type=int, default=10000, help="Saved step of the model to restore. If checking entire directory, -1 is also supported for all steps")
 
+parser.add_argument("--raw_infoset_eval", action="store_true", help="Feed the actor RAW infosets instead of symlog'd ones. Only used to force the no-symlog behavior," \
+"otherwise autodetects whether symlog should be used or no. ")
 parser.add_argument("--scale_factor", type=float, default=1.0, help="Scale factor to multiply all rewards by. Useful if the game implementation scaled rewards in a different way than traditional implementations."
                     "Then, this should be the inverse of the game scaling factor. For example, JaxLeduc divides all rewards by 13, so to get values appriopriately scaled as in literature, this should be set to 13.")
 
@@ -118,11 +120,14 @@ def get_metrics_from_dir(model_dir, args):
                 game = InformedRealGame(model)
 
         # Calculate Metric
+        #None auto-detects the input convention from the model, matching what training used.
+        # False is the pre-fix behaviour, kept so stored metrics stay reproducible.
+        use_symlog = False if args.raw_infoset_eval else None
         if args.metric == "nash_conv":
-            metric = nash_conv(model, game)
+            metric = nash_conv(model, game, use_symlog=use_symlog)
             #jax.debug.breakpoint()
         else:
-            model_map_and_behaviorals = extract_model_policy(model, game)
+            model_map_and_behaviorals = extract_model_policy(model, game, use_symlog=use_symlog)
             metric, _ = policy_expected_value(game, model_map_and_behaviorals)
         
         metric = args.scale_factor * metric
@@ -163,12 +168,20 @@ def _env_steps_per_grad_step(model):
 def _config_to_dict(model):
     """Extract config fields as a JSON-serializable dict based on model type."""
     if isinstance(model, DreamerMA):
-        return {
+        out = {
             'wm_config': dataclasses.asdict(model.wm_config),
             'ac_config': dataclasses.asdict(model.ac_config),
             'buffer_config': dataclasses.asdict(model.buffer_config),
             'optimizer_config': dataclasses.asdict(model.opt_config),
         }
+        #Under --soft_two_stage/--hard_two_stage the warm-up no longer starts at step 0: a
+        #dynamic stage one runs first, so the step at which imagination actually starts is
+        #model state and cannot be recovered from the configs alone. Record it explicitly,
+        #the way compute_expl.py already attaches learner_steps. -1 means stage one had not
+        #finished yet in this checkpoint.
+        out['imagination_start_step'] = getattr(model, "imagination_start_step", lambda: -1)()
+        out['stage_one_end_step'] = getattr(model, "stage_one_end_step", 0)
+        return out
     elif isinstance(model, (SimRNaD, SimMMD, SimPPO)):
         out = {'config': dataclasses.asdict(model.config)}
         #SimPPO has no replay buffer, hence no buffer_config
@@ -180,10 +193,17 @@ def _config_to_dict(model):
 
 def _wm_warmup_env_step(model):
     """Return the env step at which the world model warm-up period ends.
-    Returns -1 if the model has no world model or warm-up period is 0."""
+    Returns -1 if the model has no world model or warm-up period is 0.
+
+    With two stage training the boundary is stage_one_end_step + wm_warm_up_period, which
+    is model state rather than a config value, so prefer what the model recorded and fall
+    back to the plain warm-up for checkpoints predating it."""
     if not isinstance(model, DreamerMA):
         return -1
     warm_up_grad_steps = model.ac_config.wm_warm_up_period
+    recorded = getattr(model, "imagination_start_step", lambda: -1)()
+    if recorded > 0:
+        warm_up_grad_steps = recorded
     if warm_up_grad_steps <= 0:
         return -1
     return float(warm_up_grad_steps * _env_steps_per_grad_step(model))
@@ -360,7 +380,8 @@ def test_nash(args, saved_nash_path: str):
   game = InformedRealGame(model) if (isinstance(model, DreamerMA) and not model.optimizer.model.use_real_infoset) else model.game
   p1_nash_val, p2_nash_val, nash_infoset_map, nash_behaviorals = load_model(nash_path)
   print(f"Loaded nash policies of game with game value {p1_nash_val} (from player 1 perspective)")
-  model_map, model_behaviorals = extract_model_policy(model, game)
+  use_symlog = False if args.raw_infoset_eval else None
+  model_map, model_behaviorals = extract_model_policy(model, game, use_symlog=use_symlog)
   found_p1_nash, found_p2_nash = policy_expected_value(game, (nash_infoset_map, nash_behaviorals), eps=1e-5)
   found_p1_nash, found_p2_nash = args.scale_factor * found_p1_nash, args.scale_factor * found_p2_nash
   print(f"Found nash values: {found_p1_nash} {found_p2_nash}")
@@ -373,7 +394,7 @@ def test_nash(args, saved_nash_path: str):
   model_p1_val, model_p2_val = policy_expected_value(game, (model_map, model_behaviorals))
   model_p1_val, model_p2_val = args.scale_factor * model_p1_val, args.scale_factor * model_p2_val
   print(f"Model values {model_p1_val}, {model_p2_val}")
-  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game)
+  p2_br_val, p1_br_val, p1_br, p2_br = model_best_response(model, game, use_symlog=use_symlog)
   p1_br_val, p2_br_val = args.scale_factor * p1_br_val, args.scale_factor * p2_br_val
   print(f"P2 best response value against p1: {p2_br_val}")
   print(f"P1 best response value against p2 {p1_br_val}")
