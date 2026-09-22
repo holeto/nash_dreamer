@@ -15,10 +15,8 @@ parser.add_argument("--game_name", type=str, default="goofspiel_3", help="Name a
 parser.add_argument("--seeds", type=str, default='(42, )', help="Seeds of the stored models to check. Supplied as a string (seed_1, seed_2, ..., seed_n)")
 parser.add_argument("--restore_step", type=int, default=10000, help="Saved step of the model to restore. If checking entire directory, -1 is also supported for all steps")
 
-parser.add_argument("--raw_infoset_eval", action="store_true", help="Feed the actor RAW infosets instead of symlog'd ones, reproducing the behaviour of every metric stored before "
-                    "2026-09-21. Every learner symlogs real infosets before the actor sees them (and so does trajectory collection), but this evaluation path did not, so it scored a "
-                    "policy that was never trained or acted. The default now matches training; pass this flag only to reproduce a historical number.")
-
+parser.add_argument("--raw_infoset_eval", action="store_true", help="Feed the actor RAW infosets instead of symlog'd ones. Only used to force the no-symlog behavior," \
+"otherwise autodetects whether symlog should be used or no. ")
 parser.add_argument("--scale_factor", type=float, default=1.0, help="Scale factor to multiply all rewards by. Useful if the game implementation scaled rewards in a different way than traditional implementations."
                     "Then, this should be the inverse of the game scaling factor. For example, JaxLeduc divides all rewards by 13, so to get values appriopriately scaled as in literature, this should be set to 13.")
 
